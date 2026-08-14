@@ -1,0 +1,87 @@
+# GeNIE BEV planner configuration for the JetAcker + D455f.
+#
+# Derived from GENIE-SAMTP's configs/stretch_path_planner.yaml. The planner
+# algorithm and its parameters are UNCHANGED; only values that describe this
+# robot and camera differ, and this same file is used for every perception
+# model so the closed-loop comparison isolates perception.
+
+camera:
+  # Intrinsics come from /camera/d455/color/camera_info at runtime, not here.
+  # Measured on this unit at 848x480:
+  #   fx=428.5935  fy=427.9190  cx=424.6508  cy=249.5679   (89 x 59 deg)
+  # T_world_camera comes from TF (odom -> d455_color_optical_frame) per frame.
+  intrinsics: null
+  pose: null
+
+projection:
+  # Ground plane in the world frame. base_link sits on the ground below the
+  # rear axle and odom starts there, so the ground is z = 0.
+  ground_z: 0.0
+
+  # Stretch used 4.0 m forward at 0.03 m/px (grid 240). Kept as-is: the BEV
+  # extent and resolution affect both arms identically, and changing them
+  # would make the planner less comparable to the published system.
+  bev_resolution_m_per_px: 0.03
+  bev_forward_range_m: 3.0
+  bev_side_range_m: 4.0
+
+  # Beyond this, RGB rays are not projected. The D455f's 750 nm filter helps
+  # the projector's contrast up close but depth degrades past ~4-5 m, so
+  # there is little to gain from a longer ray.
+  max_ray_distance_m: 6.0
+
+depth:
+  enabled: true
+  unit: m                       # the node converts 16UC1 mm -> m before this
+
+  # Where stereo depth is trustworthy on this camera outdoors. Past this the
+  # RGB traversability carries the map, which is what the blend weights are
+  # for. Conservative: sunlight is full of IR and degrades the stereo match.
+  reliable_depth_m: 2.4
+  min_depth_m: 0.2
+
+  # A cell this far above the ground plane is non-traversable. 0.20 m is
+  # GeNIE's Stretch value and suits the JetAcker too: with 0.097 m wheels and
+  # a low chassis, anything above ~0.10 m is already impassable, so 0.20 m is
+  # permissive and lets the learned traversability decide the marginal cases.
+  obstacle_height_thresh_m: 0.20
+
+planning:
+  mode: rgbd                    # rgb | rgbd
+  # Depth dominates close in, where it is reliable; the learned map carries
+  # the rest. GeNIE's Stretch weights, kept unchanged.
+  rgb_weight: 0.2
+  depth_weight: 0.8
+
+planner:
+  # GeNIE's defaults, unmodified. The node precomputes this bank once at
+  # startup (deterministic given random_seed) and applies a curvature filter
+  # for the Ackermann minimum turning radius - neither changes the planner's
+  # behaviour on the paths that survive.
+  grid_size: 240
+  unknown_cost: 0.45
+  smooth_kernel: 3
+  num_goals: 30
+  num_mid_points_per_goal: 20
+  path_num_samples: 100
+  footprint_px: 10
+  threshold_cost: 0.50
+  threshold_points_ratio: 0.05
+  number_of_points_to_filter: 60
+  alpha: 1.0
+  best_k: 12
+  use_clustering: true
+  max_clusters: 4
+  cluster_angle_threshold_deg: 40.0
+  random_seed: 42
+  include_goal_in_path_bank: false
+  include_random_goals: true
+
+# Temporal fusion of past observations is DISABLED. GeNIE's planner has no
+# temporal fusion by default, and that is the condition under which perception
+# consistency matters most - which is the hypothesis under test. Enabling it
+# would smooth away the very effect being measured. Reviewer 4 asks what
+# happens with downstream fusion; answer that separately, offline, by
+# re-running recorded bags with this set to true.
+observation_fusion:
+  enabled: false

@@ -1,0 +1,17 @@
+# Route B - occlusion-heavy.
+#
+# Deliberately routed so the traversable corridor leaves the camera's view:
+# around a bush, behind a structure, through a gap where the ground plane
+# drops out of frame. This is where a memory of prior observations should
+# help, and where a frame-wise predictor has least to work with.
+#
+# Reporting A and B separately is not cherry-picking - reporting only B would
+# be. If the gap is larger on B than A, that supports the mechanism. If it is
+# not, that is worth knowing and saying.
+name: route_b
+description: occlusion-heavy - corridor leaves view around obstacles
+waypoints:
+  - [2.0, 0.0]
+  - [3.5, 2.0]
+  - [5.5, 2.5]
+  - [7.0, 1.0]

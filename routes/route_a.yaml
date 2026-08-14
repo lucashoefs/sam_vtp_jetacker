@@ -1,0 +1,15 @@
+# Route A - general terrain.
+#
+# Waypoints are [x_forward, y_left] in metres in ODOM, measured from where the
+# robot starts. Odometry is reset at the start of every trial, so the same
+# file gives every run of this route the identical goal sequence.
+#
+# Keep legs short (2-3 m). Open-loop odometry drifts ~0.07 deg/s of heading,
+# so a single long leg accumulates aiming error that a sequence of short ones
+# does not.
+name: route_a
+description: general terrain - uneven ground, vegetation, rocks
+waypoints:
+  - [2.5, 0.0]
+  - [5.0, 1.0]
+  - [7.0, 1.0]
