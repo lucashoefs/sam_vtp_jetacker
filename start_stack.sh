@@ -99,8 +99,21 @@ tmux send-keys -t "$P_LAUNCH" "$SRC && ros2 launch $JETACKER/robot_bringup.launc
 P_OPS=$(tmux split-window -t "$P_LAUNCH" -h -c "$JETACKER" -P -F '#{pane_id}')
 tmux send-keys -t "$P_OPS" "$SRC && clear" C-m
 if [ "$MODE" = "auto" ]; then
+    # `--once` implies `-w 1`: ros2 topic pub blocks until one matching
+    # subscription exists, in an unbounded sleep loop. That is what you want for
+    # the two enables -- it removes the discovery race, where a message published
+    # before the subscriber is matched is simply dropped and the robot silently
+    # does not start.
+    #
+    # It is exactly what you do NOT want for /route_start. Its only subscriber is
+    # waypoint_follower.py, which the launch file starts only when
+    # goal_mode:=waypoints, and this script never passes goal_mode, so the launch
+    # default of "heading" always applies and nothing subscribes. With the
+    # implied -w 1 that publish waits forever: the robot moves, because the two
+    # enables ahead of it already landed, and the operator pane hangs on a
+    # command that cannot complete. -w 0 makes it the no-op it actually is.
     tmux send-keys -t "$P_OPS" \
-      "ros2 topic pub --once /pursuit_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once /deadman_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once /route_start std_msgs/msg/Bool '{data: true}'"
+      "ros2 topic pub --once /pursuit_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once /deadman_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once -w 0 /route_start std_msgs/msg/Bool '{data: true}'"
 fi
 
 # Status watch
