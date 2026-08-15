@@ -78,35 +78,55 @@ if command -v jetson_clocks >/dev/null 2>&1; then
     sudo jetson_clocks 2>/dev/null && echo "clocks pinned to maximum"
 fi
 
+# Panes are addressed by ID (%0, %3, ...), never by index.
+#
+# tmux numbers panes by POSITION and renumbers on every split. The E-STOP split
+# below inserts a pane at index 1 and pushes the right-hand column from 1,2 to
+# 2,3 -- so `-t stack.3`, written for the pane that was just created, actually
+# lands on the status-watch pane. That is not hypothetical: it typed the E-STOP
+# setup into the pane running `watch`, where it sat buffered until watch exited
+# and then ran as a garbled command, while the real E-STOP pane got nothing at
+# all. A safety affordance that is only there on paper is worse than none.
+#
+# Pane IDs are assigned once and never reused, so they survive any resplit.
 tmux new-session -d -s $SESSION -n stack -c "$JETACKER"
+P_LAUNCH=$(tmux list-panes -t $SESSION:stack -F '#{pane_id}')
 
-# 0: the launch
-tmux send-keys -t $SESSION:stack.0 "$SRC && ros2 launch $JETACKER/robot_bringup.launch.py $ARGS" C-m
+# The launch itself
+tmux send-keys -t "$P_LAUNCH" "$SRC && ros2 launch $JETACKER/robot_bringup.launch.py $ARGS" C-m
 
-# 1: operator commands, queued but NOT run
-tmux split-window -t $SESSION:stack -h -c "$JETACKER"
-tmux send-keys -t $SESSION:stack.1 "$SRC && clear" C-m
+# Operator commands, queued but NOT run
+P_OPS=$(tmux split-window -t "$P_LAUNCH" -h -c "$JETACKER" -P -F '#{pane_id}')
+tmux send-keys -t "$P_OPS" "$SRC && clear" C-m
 if [ "$MODE" = "auto" ]; then
-    tmux send-keys -t $SESSION:stack.1 \
+    tmux send-keys -t "$P_OPS" \
       "ros2 topic pub --once /pursuit_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once /deadman_enable std_msgs/msg/Bool '{data: true}' && ros2 topic pub --once /route_start std_msgs/msg/Bool '{data: true}'"
 fi
 
-# 2: status watch
-tmux split-window -t $SESSION:stack.1 -v -c "$JETACKER"
-tmux send-keys -t $SESSION:stack.2 "$SRC && clear" C-m
+# Status watch
+P_STATUS=$(tmux split-window -t "$P_OPS" -v -c "$JETACKER" -P -F '#{pane_id}')
+tmux send-keys -t "$P_STATUS" "$SRC && clear" C-m
 if [ "$MODE" = "auto" ]; then
-    tmux send-keys -t $SESSION:stack.2 \
+    tmux send-keys -t "$P_STATUS" \
       "watch -n1 'ros2 topic echo /deadman/status --once 2>/dev/null; ros2 topic echo /pure_pursuit/status --once 2>/dev/null; ros2 topic echo /waypoint_follower/status --once 2>/dev/null'" C-m
 else
-    tmux send-keys -t $SESSION:stack.2 "ros2 topic echo /sam_vtp/status"
+    tmux send-keys -t "$P_STATUS" "ros2 topic echo /sam_vtp/status"
 fi
 
-# 3: E-STOP, one Enter away at all times
-tmux split-window -t $SESSION:stack.0 -v -p 25 -c "$JETACKER"
-tmux send-keys -t $SESSION:stack.3 "$SRC && clear && echo '=== E-STOP: press Enter ===' " C-m
-tmux send-keys -t $SESSION:stack.3 \
+# E-STOP, one Enter away at all times.
+# -l 25% rather than -p 25: -p was deprecated and then removed, and on tmux 3.4
+# it fails with "size missing", so the pane is never created and every later
+# reference to it silently does nothing.
+P_ESTOP=$(tmux split-window -t "$P_LAUNCH" -v -l 25% -c "$JETACKER" -P -F '#{pane_id}')
+tmux send-keys -t "$P_ESTOP" "$SRC && clear && echo '=== E-STOP: press Enter ===' " C-m
+tmux send-keys -t "$P_ESTOP" \
   "ros2 topic pub --once /estop std_msgs/msg/Bool '{data: true}'"
 
-tmux select-pane -t $SESSION:stack.1
+# Fail loudly rather than leaving an unarmed E-STOP looking armed.
+for p in "$P_LAUNCH" "$P_OPS" "$P_STATUS" "$P_ESTOP"; do
+    [ -n "$p" ] || { echo "ERROR: a tmux pane failed to create; E-STOP may not be armed."; break; }
+done
+
+tmux select-pane -t "$P_OPS"
 echo "started '$SESSION' mode=$MODE route=$ROUTE fps=$FPS ${RECORD:+record}"
 tmux attach -t $SESSION
