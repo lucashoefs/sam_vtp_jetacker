@@ -55,6 +55,7 @@ from sam_vtp_core import (
     build_model,
     depth_from_uint16_mm,
     pose_from_optical,
+    tune_for_inference,
 )
 
 # The axis conversion lives in the library (pose_from_optical). Do NOT also
@@ -76,17 +77,19 @@ class SamVtpGeometryNode(Node):
         self.declare_parameter("model_height", 512)
         self.declare_parameter("model_width", 512)
         self.declare_parameter("threshold", 0.5)
-        # CAREFUL: setting this to anything > 0 DISABLES CUDA graph replay
-        # (stream.py forces use_fullgraph=False when an interval is set),
-        # roughly halving throughput. It exists to space memory writes in TIME
-        # rather than by frame, reproducing the ~1.4 s bank span the model was
-        # trained with (7 slots x stride 2 / 10 fps).
+        # Memory writes are spaced so the 7-slot bank spans the ~1.4 s it was
+        # trained with (7 slots x stride 2 / 10 fps). Writing every frame at
+        # 15 fps collapses that to ~0.5 s and fills the bank with near-duplicate
+        # views; the prediction is still produced every frame either way, only
+        # the write is gated.
         #
-        # Preferred alternative: leave this at 0 and run the CAMERA at 5 fps.
-        # Every frame is then processed, memory writes land 0.2 s apart of
-        # their own accord, the span is the same 1.4 s, and graph replay
-        # still applies. Same temporal behaviour, twice the speed.
-        self.declare_parameter("memory_write_interval_s", 0.0)
+        # Set this to round(camera_fps / 5): 3 at 15 fps, 6 at 30 fps.
+        #
+        # This used to cost CUDA graph replay, because the write was baked into
+        # the capture. It no longer does -- the library captures a second graph
+        # for the frames that skip the write and branches between them in
+        # Python -- so the span and the speed are no longer a trade.
+        self.declare_parameter("memory_write_every", 3)
         # stretch | crop | pad. The D455f is 89x59 deg where training was
         # 90x90: 'stretch' exaggerates vertical structure (slope is a geometry
         # channel), 'crop' matches training aspect but loses horizontal FOV,
@@ -113,6 +116,8 @@ class SamVtpGeometryNode(Node):
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.model_hw = (int(g("model_height")), int(g("model_width")))
         self.threshold = float(g("threshold"))
+        # Same comparison the CPU path used, hoisted out of the per-frame path.
+        self.threshold_u8 = int(self.threshold * 255)
         self.world_frame = str(g("world_frame"))
         self.depth_scale = float(g("depth_scale"))
         self.stale_sec = float(g("stale_memory_sec"))
@@ -170,20 +175,27 @@ class SamVtpGeometryNode(Node):
             checkpoint, device=torch.device("cuda"), camera=cam
         )
         self.model.input_normalization_mode = "0_255"
+        # NHWC for the whole model: measured 50.3 -> 47.4 ms per frame on the
+        # Orin, because narrow convolutions are badly served by NCHW. Must come
+        # before warmup(), which is what fixes the shapes and pays for any
+        # algorithm search off the clock.
+        self.get_logger().info(tune_for_inference(self.model))
 
-        interval = float(g("memory_write_interval_s"))
-        if interval > 0:
-            self.get_logger().warn(
-                f"memory_write_interval_s={interval} disables CUDA graph "
-                f"replay; expect ~2x the latency. Consider dropping the "
-                f"camera to {1.0/interval:.0f} fps and leaving this at 0.")
+        write_every = max(1, int(g("memory_write_every")))
         self.stream = SAMVTPStreamProcessor(
             self.model,
             resize_hw=self.model_hw,
             threshold=self.threshold,
             input_fit=self.input_fit,
             use_fullgraph=True,
-            memory_write_interval_s=interval if interval > 0 else None,
+            memory_write_every=write_every,
+            # Keep the timing sync. Dropping it saves one device drain -- about
+            # 1% of a 47 ms frame -- and in exchange latency_ms stops measuring
+            # the model and starts measuring kernel launches, which read as
+            # ~0.5 ms and tell an operator nothing about whether perception is
+            # keeping up. On a robot the number you can trust at 3am is worth
+            # more than the 1%.
+            time_model_only=True,
         )
         # Pay cuDNN workspace allocation and cache filling off the clock, so
         # the robot does not eat ~400 ms on its first live frame.
@@ -382,10 +394,18 @@ class SamVtpGeometryNode(Node):
             probs = F.interpolate(probs, size=(src_h, src_w),
                                   mode="bilinear", align_corners=False)
 
-        prob_u8 = (probs[0, 0].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-        binary_u8 = np.where(
-            prob_u8 >= int(self.threshold * 255), 255, 0
-        ).astype(np.uint8)
+        # Quantise AND threshold on the GPU, then bring both planes back in a
+        # single transfer. The threshold still has to be applied after the
+        # resize -- thresholding first and interpolating after would blur the
+        # decision boundary back into grey -- but neither step needs the CPU.
+        #
+        # The CPU version of this was `np.where(prob >= t, 255, 0).astype(u8)`,
+        # which builds a 407k-element int64 intermediate before narrowing it,
+        # and measured ~20x the cost of the comparison itself.
+        prob_u8_gpu = (probs[0, 0].clamp(0, 1) * 255).to(torch.uint8)
+        binary_u8_gpu = (prob_u8_gpu >= self.threshold_u8).to(torch.uint8) * 255
+        both = torch.stack((prob_u8_gpu, binary_u8_gpu)).cpu().numpy()
+        prob_u8, binary_u8 = both[0], both[1]
 
         msg = self.bridge.cv2_to_imgmsg(binary_u8, encoding="mono8")
         msg.header = header

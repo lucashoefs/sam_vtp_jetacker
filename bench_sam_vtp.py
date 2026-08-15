@@ -105,7 +105,11 @@ def parse_args() -> argparse.Namespace:
                    help="per-submodule timing (forces eager; hooks do not fire in a graph)")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--memory-write-interval", type=float, default=0.0,
-                   help="seconds; 0 disables. NOTE: >0 may disable graph replay")
+                   help="seconds between memory writes; 0 disables")
+    p.add_argument("--memory-write-every", type=int, default=1,
+                   help="write memory every k-th frame. Set this to fps/5 to "
+                        "reproduce the ~1.4 s bank span the model trained with; "
+                        "graph replay still applies, via a second captured graph")
     # Measured from camera_info on the D455f at 848x480 (89x59 deg FOV).
     # Override for a different camera or resolution; these affect the warp
     # geometry, not the cost.
@@ -242,6 +246,7 @@ def run_mode(model, pool, args, use_fullgraph: bool) -> dict:
         threshold=args.threshold,
         input_fit=args.input_fit,
         memory_write_interval_s=interval if interval > 0 else None,
+        memory_write_every=max(1, int(args.memory_write_every)),
     )
 
     inner_ms, outer_ms = [], []

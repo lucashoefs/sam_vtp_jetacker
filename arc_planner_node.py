@@ -58,13 +58,41 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Float32, Header, String
 from tf2_ros import Buffer, TransformListener
 
-from scipy import ndimage
+import cv2
 
 from genie_path_planner import (
     blend_modalities,
     depth_to_bev_height_and_traversability,
     project_score_to_bev,
 )
+
+
+def clearance_edt(free: np.ndarray, cell_m: float) -> np.ndarray:
+    """Metres from every free cell to the nearest blocked one.
+
+    Was `scipy.ndimage.distance_transform_edt`. Dropped because scipy is not a
+    dependency this stack can rely on: on the Jetson the venv's `scipy.ndimage`
+    imports but has no `distance_transform_edt`, which raised once per planning
+    cycle and stopped the planner dead -- including before it published /bev, so
+    the failure also took out the one view that would have shown what was wrong.
+    OpenCV is already a hard dependency through cv_bridge, so this cannot fail
+    without the node failing first.
+
+    Same function, same semantics: distance from each non-zero cell to the
+    nearest zero. Measured against scipy on the real 100x267 grid, max|diff| was
+    2e-7 m sparse, 5e-8 m dense, 8e-6 m for a single obstacle -- float32 rounding
+    against a 3 cm cell -- and it is ~6.5x faster (0.095 ms vs 0.615 ms).
+
+    The exception is an empty `block_mask`. scipy then returns a bounded but
+    arbitrary field; cv2 saturates at 65535, which is 1966 m and would leak an
+    absurd clearance into the cost. Nothing is blocking, so the honest answer is
+    "further than this grid can express": the grid diagonal.
+    """
+    if not np.any(~free):
+        h, w = free.shape
+        return np.full(free.shape, float(np.hypot(h, w) * cell_m), dtype=np.float32)
+    return cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2,
+                                 cv2.DIST_MASK_PRECISE) * cell_m
 
 
 def quat_to_matrix(x, y, z, w) -> np.ndarray:
@@ -548,8 +576,8 @@ class ArcPlanner(Node):
         integ_obs = integral(block_mask.astype(np.float64))
 
         # Metres from every free cell to the nearest blocking cell. One EDT
-        # per frame (~1 ms at 240x240) replaces a per-arc search.
-        clearance_map = ndimage.distance_transform_edt(~block_mask) * self.bev_res
+        # per frame (~0.1 ms at 100x267) replaces a per-arc search.
+        clearance_map = clearance_edt(~block_mask, self.bev_res)
         # Second table over obstacles only, so a failure can be attributed to
         # a real obstacle rather than to unobserved space. Guessing which of
         # the two is responsible has cost several iterations.

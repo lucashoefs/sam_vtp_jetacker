@@ -52,6 +52,25 @@ tmux has-session -t $SESSION 2>/dev/null && {
     echo "session '$SESSION' exists: tmux attach -t $SESSION"
     echo "                or kill:  tmux kill-session -t $SESSION"; exit 1; }
 
+# Power mode first, then clocks. jetson_clocks pins to the ceiling of the
+# ACTIVE nvpmodel profile and cannot exceed it, so pinning clocks while the
+# board sits in a low-power mode quietly runs the whole stack at that mode's
+# cap. The Super modes are worth roughly 1.6x GPU clock and 1.5x memory
+# bandwidth over the launch defaults, which is more than any code change here.
+#
+# Not set automatically: mode IDs differ between boards and JetPack versions,
+# and switching modes can reboot. Checked loudly instead.
+if command -v nvpmodel >/dev/null 2>&1; then
+    MODE="$(sudo nvpmodel -q 2>/dev/null | tr '\n' ' ')"
+    case "$MODE" in
+        *SUPER*|*MAXN*) echo "power mode: $MODE" ;;
+        *) echo "WARNING: power mode is '$MODE', not a MAXN/Super mode."
+           echo "         GPU clock and memory bandwidth are capped below what"
+           echo "         this board can do. 'sudo nvpmodel -m <id>' to fix;"
+           echo "         'sudo nvpmodel -p --verbose' lists the ids." ;;
+    esac
+fi
+
 # Pin the clocks. Without this the schedutil governor reads the bursty,
 # latency-sensitive load as moderate average utilisation and drops to
 # 730 MHz - which measured as a ~2x latency penalty across the pipeline.

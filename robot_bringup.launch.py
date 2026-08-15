@@ -263,6 +263,9 @@ def launch_setup(context, *args, **kwargs):
                 "-p", f"info_topic:=/{CAM_NS}/{CAM_NAME}/color/camera_info",
                 "-p", "world_frame:=odom",
                 "-p", f"input_fit:={LaunchConfiguration('input_fit').perform(context)}",
+                # Memory writes 0.2 s apart whatever the camera rate, so the
+                # 7-slot bank spans the ~1.4 s the model trained with.
+                "-p", f"memory_write_every:={max(1, round(int(fps) / 5))}",
             ],
             cwd=JETACKER_DIR,
             output="screen",
@@ -331,6 +334,22 @@ def launch_setup(context, *args, **kwargs):
 
     if _flag(context, "foxglove"):
         # foxglove_bridge ships an XML launch file, not a Python one.
+        #
+        # BANDWIDTH. Raw pixels do not fit over WiFi. At 848x480 the colour
+        # stream alone is 146 Mbit/s, aligned depth another 98, and the two mask
+        # topics 40 each -- ~324 Mbit/s with all four open. The link saturates,
+        # the bridge logs "outbox for client ... full", and TCP bufferbloat turns
+        # the overflow into tens of seconds of lag rather than clean drops.
+        #
+        # Two mitigations here; the third is yours. use_compression applies
+        # websocket permessage-deflate, which costs Orin CPU but is very
+        # effective on the mask topics (large uniform regions). send_buffer_limit
+        # caps how much can queue before the bridge drops: a smaller buffer
+        # trades completeness for freshness, which is the right trade for
+        # watching a robot drive. The third is to subscribe to
+        # .../image_raw/compressed rather than .../image_raw in Studio -- the
+        # RealSense driver already publishes it (see RECORD_TOPICS) and it is
+        # worth more than either parameter below.
         actions.append(GroupAction(
             scoped=True,
             forwarding=False,
@@ -341,7 +360,11 @@ def launch_setup(context, *args, **kwargs):
                         "launch", "foxglove_bridge_launch.xml",
                     )
                 ),
-                launch_arguments={"port": "8765"}.items(),
+                launch_arguments={
+                    "port": "8765",
+                    "use_compression": LaunchConfiguration("fg_compress").perform(context),
+                    "send_buffer_limit": LaunchConfiguration("fg_buffer").perform(context),
+                }.items(),
             )],
         ))
 
@@ -392,6 +415,13 @@ def generate_launch_description():
             HOME, "jetacker", "routes", "route_a.yaml")),
         DeclareLaunchArgument("max_speed", default_value="0.25"),
         DeclareLaunchArgument("foxglove", default_value="true"),
+        # See the foxglove_bridge block for why these exist. Compression costs
+        # CPU on a board whose CPU is already shared with the perception node,
+        # so turn it off if you would rather spend that elsewhere. The buffer is
+        # bytes: 10 MB is the bridge's own default and is far too much for a
+        # saturated link, since every queued byte is latency you will watch.
+        DeclareLaunchArgument("fg_compress", default_value="true"),
+        DeclareLaunchArgument("fg_buffer", default_value="1000000"),
         DeclareLaunchArgument("record", default_value="false"),
         # The D455 offers 848x480 at 5/15/30/60 only - there is no 10, and
         # asking for one does not fail loudly: the driver falls back to its
@@ -403,12 +433,13 @@ def generate_launch_description():
         # camera stops being the constraint and perceptual latency falls
         # roughly threefold.
         #
-        # The cost is temporal: the model processes ~10 fps of the 15, so the
-        # 7-slot memory bank spans ~0.7 s rather than the ~1.4 s it trained
-        # with. memory_write_interval_s:=0.2 restores that span, at the price
-        # of CUDA graph replay (worth 1.44x on the benchmark). Which matters
-        # more is a question about the model, not the platform - measure both
-        # on real footage before the trials.
+        # This used to cost temporal context: writing memory every frame at
+        # 15 fps gives the 7-slot bank a ~0.5 s span against the ~1.4 s it
+        # trained with, and the fix (gating the writes) turned off CUDA graph
+        # replay, worth 1.44x. Both are available now - the node's
+        # memory_write_every defaults to 3, which puts writes 0.2 s apart at
+        # 15 fps and keeps replay. If you change fps, change it too:
+        # round(fps / 5).
         DeclareLaunchArgument("fps", default_value="15"),
         # MEASURE THIS. Positive pitches the camera down. Unmeasured pitch is
         # the largest single source of error in the geometry channels.
