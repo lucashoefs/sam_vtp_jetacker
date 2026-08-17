@@ -47,9 +47,38 @@ depth:
   obstacle_height_thresh_m: 0.20
 
 planning:
-  mode: rgbd                    # rgb | rgbd
-  # Depth dominates close in, where it is reliable; the learned map carries
-  # the rest. GeNIE's Stretch weights, kept unchanged.
+  # rgb | rgbd | veto
+  #
+  # VETO is the configuration for the closed-loop perception comparison.
+  #
+  # WHY NOT rgbd. GeNIE blends a hand-coded depth obstacle map into the cost at
+  # depth_weight 0.8. That term is computed by the planner itself and is byte
+  # identical for every perception model, so it contributes nothing to the
+  # difference between two models while contributing most of the magnitude:
+  #   cost_A - cost_B = rgb_weight * (score_A - score_B)
+  # i.e. the effect under test is attenuated 5x. Worse for SAM-TP vs SAM-VTP
+  # specifically -- the comparison axis IS depth (SAM-TP has no depth input,
+  # run_ablation_v5.sh row 1) so blending depth in the planner hands the
+  # baseline a depth-derived obstacle map for free, through the back door.
+  #
+  # Geometry also reaches further than it looks: arcs run to horizon_m 2.5 and
+  # reliable_depth_m is 2.4, so ~96% of every scored arc sits in the blended
+  # zone. The band where the model owns the cost outright (2.4-3.0 m) is almost
+  # entirely beyond the arc horizon.
+  #
+  # WHAT VETO DOES. Depth may only ever ADD obstacles. Cells measured above
+  # obstacle_height_thresh_m are forced non-traversable; every other cell, and
+  # all continuous terrain cost, comes from the model. The geometric backstop
+  # that stops the robot driving into solid objects is kept -- see the beanbag
+  # note on unknown_blocks in arc_planner_node.py -- while a binary height test
+  # cannot supply the flat-terrain discrimination the comparison is about.
+  #
+  # Report rgbd as a secondary condition: it is the deployed configuration and
+  # keeps comparability with GeNIE's published planner.
+  mode: veto
+
+  # Used by `rgbd` only; `veto` ignores both. GeNIE's Stretch weights, unchanged,
+  # so the secondary condition stays comparable to the published system.
   rgb_weight: 0.2
   depth_weight: 0.8
 

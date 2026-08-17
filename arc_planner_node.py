@@ -66,6 +66,26 @@ from genie_path_planner import (
     project_score_to_bev,
 )
 
+# How depth is allowed to influence the BEV cost surface.
+#
+#   rgbd  GeNIE's published fusion: cost = (rgb_w*score + depth_w*depth_trav).
+#         At the shipped 0.2/0.8 weights the hand-coded depth estimate carries
+#         80% of the cost, and it is identical for every perception model. Fine
+#         for deployment, wrong for a perception comparison: the term that
+#         distinguishes two models is attenuated 5x, and a model with no depth
+#         input is handed a depth-derived obstacle map for free.
+#
+#   veto  Depth may only ever ADD obstacles, never clear them. Cells whose
+#         measured height exceeds obstacle_height_thresh_m are forced
+#         non-traversable; everything else comes from the model alone. Keeps the
+#         geometric backstop that stops the robot driving into solid objects
+#         while leaving all continuous terrain judgement to perception. A binary
+#         height veto cannot supply fine flat-terrain discrimination, so what the
+#         comparison measures is still the model's.
+#
+#   rgb   Model score only. Cleanest isolation, no geometric backstop at all.
+PLANNING_MODES = ("rgb", "rgbd", "veto")
+
 
 def clearance_edt(free: np.ndarray, cell_m: float) -> np.ndarray:
     """Metres from every free cell to the nearest blocked one.
@@ -236,6 +256,25 @@ class ArcPlanner(Node):
         # toward the roomier of two viable arcs without refusing tight gaps.
         self.declare_parameter("clearance_pref_m", 0.15)
         self.declare_parameter("clearance_weight", 0.4)
+        # LOOKAHEAD: reward arcs that END somewhere open.
+        #
+        # Progress alone scores an arc by how far it gets, which says nothing
+        # about whether it leads anywhere. A corridor into a dead end scores
+        # as well as an open one until the wall is close enough to cut the
+        # arc short - and by then the only options left are tight arcs that
+        # are physically short, so they score badly too and the robot stops.
+        #
+        # Simulated on a dead end at 2 m with a side opening at 0.5-1.3 m,
+        # the planner drove straight past the opening, then turned the WRONG
+        # way at 1.4 m, then stopped. With this term it turns into the
+        # opening immediately.
+        #
+        # Measured against OBSTACLES ONLY, not unobserved space: an arc
+        # reaching the edge of the camera's wedge is not in a dead end, it is
+        # just at the limit of what has been seen, and penalising that would
+        # make the robot refuse to approach anything it cannot see past.
+        self.declare_parameter("lookahead_weight", 1.5)
+        self.declare_parameter("lookahead_clearance_m", 0.6)
         # Reward for PROGRESS along the goal bearing, in place of a penalty
         # on deviating from it.
         #
@@ -254,6 +293,11 @@ class ArcPlanner(Node):
         self.declare_parameter("goal_mode", "heading")
         self.declare_parameter("max_heading_error_deg", 80.0)
         self.declare_parameter("publish_bev", True)
+        # Overrides planning.mode in the config file when non-empty, so the two
+        # closed-loop conditions (veto = isolating, rgbd = as-deployed) can be
+        # alternated from the launch line without editing the config between
+        # runs -- an edit that would otherwise not be recorded in the bag.
+        self.declare_parameter("fusion_mode", "")
 
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.world_frame = str(g("world_frame"))
@@ -275,6 +319,8 @@ class ArcPlanner(Node):
         self.safety_margin = float(g("safety_margin_m"))
         self.clearance_pref = float(g("clearance_pref_m"))
         self.w_clear = float(g("clearance_weight"))
+        self.w_look = float(g("lookahead_weight"))
+        self.look_ref = float(g("lookahead_clearance_m"))
         self.publish_bev = bool(g("publish_bev"))
         self.stride = max(1, int(g("projection_stride")))
 
@@ -291,7 +337,30 @@ class ArcPlanner(Node):
         self.obstacle_h = float(dep.get("obstacle_height_thresh_m", 0.20))
         self.rgb_w = float(plan.get("rgb_weight", 0.2))
         self.depth_w = float(plan.get("depth_weight", 0.8))
-        self.mode = str(plan.get("mode", "rgbd"))
+        _override = str(g("fusion_mode")).strip().lower()
+        self.mode = _override or str(plan.get("mode", "rgbd")).strip().lower()
+        # Validated, not defaulted. An unrecognised mode previously fell through
+        # the `else` in _plan_once to score-only planning, silently dropping the
+        # geometric obstacle backstop -- a typo in the config would have removed
+        # a safety property with no message. Refuse to start instead.
+        if self.mode not in PLANNING_MODES:
+            raise ValueError(
+                f"planning.mode={self.mode!r} is not one of "
+                f"{sorted(PLANNING_MODES)}. Refusing to start: an unrecognised "
+                "mode would silently plan on the model score alone and drop the "
+                "depth obstacle backstop.")
+        self.get_logger().info({
+            "rgbd": (f"depth fusion: BLENDED (rgb {self.rgb_w:g} / depth "
+                     f"{self.depth_w:g}) -- the hand-coded depth estimate carries "
+                     f"{self.depth_w / max(self.rgb_w + self.depth_w, 1e-9):.0%} of "
+                     "the cost and is identical for every model; NOT an isolating "
+                     "configuration for a perception comparison"),
+            "veto": (f"depth fusion: VETO ONLY (height >= {self.obstacle_h:.2f} m "
+                     "forced non-traversable; all continuous terrain cost from the "
+                     "model). Depth can add obstacles, never clear them"),
+            "rgb": ("depth fusion: NONE -- planning on the model score alone, "
+                    "no geometric obstacle backstop"),
+        }[self.mode])
 
         self._build_arcs(int(g("num_arcs")), float(g("min_turn_radius_m")),
                          float(g("horizon_m")), int(g("arc_samples")),
@@ -319,6 +388,7 @@ class ArcPlanner(Node):
         self._last_reach = 0.0
         self._last_clear = 0.0
         self._last_progress = 0.0
+        self._veto_cells = 0
         self._last_best = 0
 
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -343,6 +413,7 @@ class ArcPlanner(Node):
         self.pub_no_path = self.create_publisher(Bool, "~/no_path", 1)
         self.pub_reach = self.create_publisher(Float32, "~/mean_reach", 10)
         self.pub_clear = self.create_publisher(Float32, "~/min_clearance_m", 10)
+        self.pub_look = self.create_publisher(Float32, "~/end_clearance_m", 10)
         self.pub_progress = self.create_publisher(Float32, "~/progress_m", 10)
         self.pub_status = self.create_publisher(String, "~/status", 10)
         self.pub_stamp = self.create_publisher(Header, "~/stamp", 10)
@@ -533,6 +604,36 @@ class ArcPlanner(Node):
                 self.bev_res, self.bev_fwd, self.bev_side)
             bev, obs = blend_modalities(rgb_bev, rgb_obs, d_bev, d_obs,
                                         self.rgb_w, self.depth_w)
+        elif self.mode == "veto" and depth_p is not None:
+            # Height only. The continuous part of the depth traversability -- the
+            # 1 - h/thresh ramp below the threshold -- is exactly the 0.8-weighted
+            # vote on terrain that would mask the difference between models, so it
+            # is discarded here and only the binary "taller than the threshold"
+            # decision is kept.
+            height, _, d_obs, _ = depth_to_bev_height_and_traversability(
+                depth_p, K, pose, self.ground_z,
+                self.reliable_depth, self.min_depth, self.obstacle_h,
+                self.bev_res, self.bev_fwd, self.bev_side)
+            bev = np.array(rgb_bev, dtype=np.float32, copy=True)
+            obs = np.asarray(rgb_obs, dtype=bool).copy()
+            # height is NaN where depth saw nothing; isfinite keeps those out.
+            tall = (np.asarray(d_obs, dtype=bool)
+                    & np.isfinite(height)
+                    & (height >= self.obstacle_h))
+            # Traversability 0 becomes cost 1 where `cost` is formed below, which
+            # puts these cells in obstacle_mask and so also into the obstacle-only
+            # EDT behind the lookahead term: a wall the model missed still reads
+            # as a dead end. Marked observed as well, so an arc stopping here is
+            # attributed to an OBSTACLE and not to unobserved space -- the two
+            # need opposite fixes and the all-blocked diagnostic counts them
+            # separately.
+            bev[tall] = 0.0
+            obs[tall] = True
+            # Deliberately asymmetric: depth is never used to mark a cell
+            # traversable or observed. A cell the model never saw stays unknown
+            # even where depth reports flat ground, so geometry can only ever
+            # subtract free space, never manufacture it.
+            self._veto_cells = int(np.count_nonzero(tall))
         else:
             bev, obs = rgb_bev, rgb_obs
         t_proj = (time.perf_counter() - t0) * 1000.0
@@ -582,6 +683,8 @@ class ArcPlanner(Node):
         # a real obstacle rather than to unobserved space. Guessing which of
         # the two is responsible has cost several iterations.
         integ_hard = integral(obstacle_mask.astype(np.float64))
+        # Second EDT over obstacles only, for the lookahead term.
+        obstacle_clearance = clearance_edt(~obstacle_mask, self.bev_res)
 
         rr = np.round(rows).astype(np.int64)
         cc = np.round(cols).astype(np.int64)
@@ -635,19 +738,30 @@ class ArcPlanner(Node):
         # Cap at a quarter of each arc's samples: a 0.39 m arc cannot be
         # asked to clear 0.3 m, which would demand 31 of its 40 samples and
         # reject every tight turn regardless of the scene.
-        min_clear = np.minimum(
+        # NAME MATTERS HERE. This is a SAMPLE INDEX threshold. It used to be
+        # called min_clear, which was then reassigned below to a clearance in
+        # METRES - so the rejection test `first_block < min_clear` compared a
+        # sample index (0..40) against ~0.15 m and only ever rejected arcs
+        # blocked at sample 0. An arc blocked at sample 1 was accepted, and
+        # for the straight arc sample 1 is 6 cm ahead of the bumper. That is
+        # why the robot clipped things it had correctly marked as obstacles.
+        min_block_samples = np.minimum(
             np.maximum(1, np.ceil(0.3 / np.maximum(step_m, 1e-6))),
             max(1, self.arcs.shape[1] // 4))
 
+        end_idx = np.clip(first_block - 1, 0, self.arcs.shape[1] - 1)
+        rows_i = np.arange(len(self.arcs))
+
         # Worst clearance along each arc, up to where it is blocked.
         clr = clearance_map[np.clip(rr, 0, h - 1), np.clip(cc, 0, w - 1)]
-        clr = np.where(valid, clr, np.inf)
-        min_clear = np.min(clr, axis=1)
-        min_clear = np.where(np.isfinite(min_clear), min_clear, self.clearance_pref)
+        clr_valid = np.where(valid, clr, np.inf)
+        min_clearance_m = np.min(clr_valid, axis=1)
+        min_clearance_m = np.where(np.isfinite(min_clearance_m),
+                                   min_clearance_m, self.clearance_pref)
         # Only shortfall against the preferred clearance is penalised; beyond
         # it, extra room buys nothing and should not distort the route.
         clearance_pen = np.clip(
-            (self.clearance_pref - min_clear) / max(self.clearance_pref, 1e-6),
+            (self.clearance_pref - min_clearance_m) / max(self.clearance_pref, 1e-6),
             0.0, 1.0)
 
         bearing = self._goal_bearing()
@@ -656,8 +770,6 @@ class ArcPlanner(Node):
         # nominal end: an arc blocked early has not turned as far as its full
         # geometry suggests, and scoring the unreached end would credit it
         # with a deviation it never makes.
-        end_idx = np.clip(first_block - 1, 0, self.arcs.shape[1] - 1)
-        rows_i = np.arange(len(self.arcs))
         end_xy = self.arcs[rows_i, end_idx]
         arc_bearing = np.arctan2(end_xy[:, 1], end_xy[:, 0])
 
@@ -666,15 +778,24 @@ class ArcPlanner(Node):
         progress_m = reached_m * np.cos(arc_bearing - bearing)
         progress = progress_m / max(self.arc_lengths.max(), 1e-6)
 
+        # How open is it where this arc actually ends? A dead end reads low,
+        # open ground reads high, and the difference shows up while there is
+        # still room to act on it.
+        end_clearance = obstacle_clearance[
+            np.clip(rr[rows_i, end_idx], 0, h - 1),
+            np.clip(cc[rows_i, end_idx], 0, w - 1)]
+        lookahead = np.clip(end_clearance / max(self.look_ref, 1e-6), 0.0, 1.0)
+
         total = (terrain
                  + self.w_clear * clearance_pen
                  - self.w_progress * progress
+                 - self.w_look * lookahead
                  + self.w_curv * np.abs(self.kappas) / max(np.abs(self.kappas).max(), 1e-6))
 
         # Arcs blocked within the first ~0.3 m are not merely expensive, they
         # are immediate contact. Drop them rather than let a heading bonus
         # rescue one.
-        total = np.where(first_block < min_clear, np.inf, total)
+        total = np.where(first_block < min_block_samples, np.inf, total)
 
         if not np.isfinite(total).any():
             self.no_path += 1
@@ -692,7 +813,7 @@ class ArcPlanner(Node):
                 f"{int(first_block[straight])}/{self.arcs.shape[1]} "
                 f"({first_block[straight] * self.arc_lengths[straight] / self.arcs.shape[1]:.2f} m), "
                 f"obstacle at {int(first_hard[straight])}. "
-                f"min_clear={int(min_clear[straight])}. "
+                f"min_block_samples={int(min_block_samples[straight])}. "
                 f"Raise blind_radius_m (now {self.blind_radius}) if unknown "
                 f"dominates, or lower front_offset_m (now checking "
                 f"{self.check_pts[straight, 0, 0]:.2f} m ahead).",
@@ -743,7 +864,9 @@ class ArcPlanner(Node):
         # choosing freely or scraping for any survivor.
         self.pub_progress.publish(Float32(data=float(progress_m[best])))
         self._last_progress = float(progress_m[best])
-        self._last_clear = float(min_clear[best]) if np.isfinite(min_clear[best]) else -1.0
+        self.pub_look.publish(Float32(data=float(end_clearance[best])))
+        self._last_clear = (float(min_clearance_m[best])
+                            if np.isfinite(min_clearance_m[best]) else -1.0)
         self.pub_clear.publish(Float32(data=self._last_clear))
         self._last_reach = float(np.mean(reach))
         self.pub_reach.publish(Float32(data=self._last_reach))
@@ -799,7 +922,9 @@ class ArcPlanner(Node):
             f"progress={self._last_progress:.2f}m "
             f"unknown_blocks={self.unknown_blocks} stride={self.stride} "
             f"obs_cost={self.obstacle_cost:.2f} block_ratio={self.block_ratio:.2f} "
-            f"mode={self.goal_mode}"
+            f"fusion={self.mode}"
+            + (f" veto_cells={self._veto_cells}" if self.mode == "veto" else "")
+            + f" mode={self.goal_mode}"
             + (f" ref_yaw={math.degrees(self.ref_yaw):+.0f}deg"
                if self.ref_yaw is not None else ""))))
 

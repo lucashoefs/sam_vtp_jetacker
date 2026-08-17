@@ -180,6 +180,14 @@ class SamVtpGeometryNode(Node):
         # before warmup(), which is what fixes the shapes and pays for any
         # algorithm search off the clock.
         self.get_logger().info(tune_for_inference(self.model))
+        # Read from the checkpoint, never assumed: a model without the warp does
+        # not need TF at all, and saying so here is what actually removes the
+        # dependency from the pipeline.
+        self.needs_pose = bool(getattr(self.model, "needs_pose", True))
+        self.get_logger().info(
+            f"pose required by this checkpoint: {self.needs_pose}"
+            + ("" if self.needs_pose else "  (no TF dependency; frames will not "
+                                          "be dropped for a stale transform)"))
 
         write_every = max(1, int(g("memory_write_every")))
         self.stream = SAMVTPStreamProcessor(
@@ -319,13 +327,20 @@ class SamVtpGeometryNode(Node):
 
     # ------------------------------------------------------------------
     def _on_pair(self, color_msg: Image, depth_msg: Image) -> None:
-        pose = self._lookup_pose(color_msg.header)
-        if pose is None:
-            self.no_pose += 1
-            self.get_logger().warn(
-                f"no transform {self.world_frame} -> {color_msg.header.frame_id}; "
-                "is odometry running?", throttle_duration_sec=5.0)
-            return
+        # Only the memory warp reads pose. A geometry-only checkpoint derives its
+        # channels from depth and intrinsics alone, so refusing to run without a
+        # transform would impose a localisation dependency the weights do not
+        # have -- and it is not free: a stale TF drops the frame outright, which
+        # is where `no_pose` and part of `dropped` come from on this robot.
+        pose = None
+        if self.needs_pose:
+            pose = self._lookup_pose(color_msg.header)
+            if pose is None:
+                self.no_pose += 1
+                self.get_logger().warn(
+                    f"no transform {self.world_frame} -> {color_msg.header.frame_id}; "
+                    "is odometry running?", throttle_duration_sec=5.0)
+                return
 
         try:
             rgb = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="rgb8")

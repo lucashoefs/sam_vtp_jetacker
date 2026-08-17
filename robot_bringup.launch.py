@@ -288,6 +288,7 @@ def launch_setup(context, *args, **kwargs):
                 "-p", ("plan_rate:=10.0" if ptype == "arc" else "plan_rate:=2.0"),
                 "-p", f"goal_distance_m:={LaunchConfiguration('goal_distance').perform(context)}",
                 "-p", f"goal_mode:={LaunchConfiguration('goal_mode').perform(context)}",
+                "-p", f"fusion_mode:={LaunchConfiguration('fusion_mode').perform(context)}",
             ],
             cwd=JETACKER_DIR,
             output="screen",
@@ -410,6 +411,11 @@ def generate_launch_description():
         #             to trust over the whole run, which open-loop dead
         #             reckoning on grass is not.
         DeclareLaunchArgument("goal_mode", default_value="heading"),
+        # "" = take planning.mode from jetacker_planner.yaml (currently veto).
+        # veto = isolating condition for the perception comparison; rgbd = the
+        # as-deployed GeNIE blend, reported as the secondary condition.
+        DeclareLaunchArgument("fusion_mode", default_value="",
+                              description="'' | rgb | rgbd | veto"),
         DeclareLaunchArgument("goal_distance", default_value="3.0"),
         DeclareLaunchArgument("route", default_value=os.path.join(
             HOME, "jetacker", "routes", "route_a.yaml")),
