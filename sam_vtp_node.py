@@ -112,6 +112,26 @@ class SamVtpGeometryNode(Node):
         self.declare_parameter("max_pose_skew_s", 0.12)
         self.declare_parameter("publish_probability", True)
         self.declare_parameter("log_every_n", 150)
+        # DEGENERATE OUTPUT WATCH.
+        #
+        # This model is recurrent: each frame is conditioned on a bank of the
+        # previous 7. It was trained on 24-frame clips (~5 s) and at 10 Hz a
+        # deployment run is thousands of frames, so the state runs orders of
+        # magnitude longer than anything it saw in training. If it drifts to a
+        # degenerate fixed point the mask goes uniformly black, the planner
+        # sees no traversable ground, and the deadman correctly stops the
+        # robot - a total failure that looks, from every health counter, like
+        # a perfectly healthy node.
+        #
+        # Detection is on the PROBABILITY map, not the thresholded mask: a max
+        # near zero is collapse, whereas a max around 0.4 is a model still
+        # discriminating but below threshold, and the two need opposite fixes.
+        self.declare_parameter("degenerate_max_prob", 0.05)
+        self.declare_parameter("degenerate_frames", 20)
+        # Auto-reset is OFF by default and should stay off for trials. How
+        # often the state collapses IS a result about the method; recovering
+        # from it silently would hide the very thing worth reporting.
+        self.declare_parameter("auto_reset_on_degenerate", False)
 
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.model_hw = (int(g("model_height")), int(g("model_width")))
@@ -124,6 +144,11 @@ class SamVtpGeometryNode(Node):
         self.log_every_n = int(g("log_every_n"))
         self.input_fit = str(g("input_fit"))
         self.max_pose_skew = float(g("max_pose_skew_s"))
+        self.degen_thresh = float(g("degenerate_max_prob"))
+        self.degen_frames = int(g("degenerate_frames"))
+        self.auto_reset = bool(g("auto_reset_on_degenerate"))
+        self._degen_run = 0
+        self.degen_events = 0
 
         checkpoint = str(g("checkpoint"))
         if not checkpoint:
@@ -254,6 +279,12 @@ class SamVtpGeometryNode(Node):
         self.pub_age = self.create_publisher(Float32, "~/frame_age_ms", 10)
         self.pub_ready = self.create_publisher(Bool, "~/ready", 10)
         self.pub_status = self.create_publisher(String, "~/status", 10)
+        self.pub_maxprob = self.create_publisher(Float32, "~/max_prob", 10)
+        self.pub_degen = self.create_publisher(Bool, "~/degenerate", 1)
+        # Manual recovery without restarting the process, so a collapse can be
+        # cleared mid-run and the event still counted.
+        self.create_subscription(Bool, "~/reset_memory", self._on_reset, 1,
+                                 callback_group=self.cb_group)
         # Echo of the SOURCE frame stamp, published the moment this stage
         # finishes. Lets a profiler join stages by frame without subscribing
         # to the image topics, which would itself distort what it measures.
@@ -269,6 +300,14 @@ class SamVtpGeometryNode(Node):
             self.camera_info = msg
 
     # ------------------------------------------------------------------
+    def _on_reset(self, msg: Bool) -> None:
+        if msg.data:
+            self.stream.reset()
+            self._degen_run = 0
+            self.get_logger().warn(
+                "temporal memory reset by request; CUDA graph will re-capture "
+                "over the next ~20 frames")
+
     def _lookup_pose(self, header) -> Optional[np.ndarray]:
         """Camera pose as [x y z qx qy qz qw] with NED-body camera axes.
 
@@ -417,10 +456,45 @@ class SamVtpGeometryNode(Node):
         # The CPU version of this was `np.where(prob >= t, 255, 0).astype(u8)`,
         # which builds a 407k-element int64 intermediate before narrowing it,
         # and measured ~20x the cost of the comparison itself.
+        # Peak probability BEFORE thresholding. This is what separates a
+        # collapsed recurrent state (max ~0) from a model still discriminating
+        # but sitting under the threshold (max ~0.4) - the two look identical
+        # in the binary mask and need opposite fixes.
+        #
+        # Taken from the same GPU tensor and moved across with the images
+        # below, so it costs no extra device->host transfer.
+        max_prob_gpu = probs.max()
+
         prob_u8_gpu = (probs[0, 0].clamp(0, 1) * 255).to(torch.uint8)
         binary_u8_gpu = (prob_u8_gpu >= self.threshold_u8).to(torch.uint8) * 255
         both = torch.stack((prob_u8_gpu, binary_u8_gpu)).cpu().numpy()
         prob_u8, binary_u8 = both[0], both[1]
+
+        max_prob = float(max_prob_gpu.item())
+        self.pub_maxprob.publish(Float32(data=max_prob))
+
+        if max_prob < self.degen_thresh:
+            self._degen_run += 1
+            if self._degen_run == self.degen_frames:
+                self.degen_events += 1
+                self.pub_degen.publish(Bool(data=True))
+                self.get_logger().error(
+                    f"OUTPUT COLLAPSED: peak probability {max_prob:.3f} for "
+                    f"{self.degen_frames} consecutive frames after "
+                    f"{self.processed} total. The mask is uniformly black, so "
+                    f"the planner sees no traversable ground and the deadman "
+                    f"will stop the robot. Recover with: ros2 topic pub --once "
+                    f"/sam_vtp/reset_memory std_msgs/msg/Bool '{{data: true}}'")
+                if self.auto_reset:
+                    self.get_logger().warn("auto_reset_on_degenerate: resetting")
+                    self.stream.reset()
+                    self._degen_run = 0
+        else:
+            if self._degen_run >= self.degen_frames:
+                self.pub_degen.publish(Bool(data=False))
+                self.get_logger().info(
+                    f"output recovered: peak probability {max_prob:.3f}")
+            self._degen_run = 0
 
         msg = self.bridge.cv2_to_imgmsg(binary_u8, encoding="mono8")
         msg.header = header
@@ -452,6 +526,7 @@ class SamVtpGeometryNode(Node):
             f"in={self.frames_in} synced={self.processed + self.dropped} "
             f"unsynced={max(0, self.frames_in - self.processed - self.dropped)} "
             f"no_pose={self.no_pose} skewed={self.skewed_poses} "
+            f"collapses={self.degen_events} "
             f"graph={self.stream.graph_status}"
         )))
 

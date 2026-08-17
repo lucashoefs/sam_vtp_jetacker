@@ -276,6 +276,12 @@ def launch_setup(context, *args, **kwargs):
         ptype = LaunchConfiguration("planner_type").perform(context)
         script = ("arc_planner_node.py" if ptype == "arc"
                   else "genie_planner_node.py")
+        # An EMPTY value here is not "use the default" - `-p fusion_mode:=`
+        # is malformed to the --ros-args parser, and rclpy.init() exits before
+        # the node exists. No node, no logger, no traceback: the launch looks
+        # as though the planner was never started. Omit the flag instead.
+        fusion = LaunchConfiguration("fusion_mode").perform(context).strip()
+        fusion_args = ["-p", f"fusion_mode:={fusion}"] if fusion else []
         actions.append(ExecuteProcess(
             cmd=[
                 VENV_PY,
@@ -288,10 +294,12 @@ def launch_setup(context, *args, **kwargs):
                 "-p", ("plan_rate:=10.0" if ptype == "arc" else "plan_rate:=2.0"),
                 "-p", f"goal_distance_m:={LaunchConfiguration('goal_distance').perform(context)}",
                 "-p", f"goal_mode:={LaunchConfiguration('goal_mode').perform(context)}",
-                "-p", f"fusion_mode:={LaunchConfiguration('fusion_mode').perform(context)}",
-            ],
+            ] + fusion_args,
             cwd=JETACKER_DIR,
             output="screen",
+            # Without this a process that dies during argument parsing or
+            # import produces no output at all.
+            emulate_tty=True,
             additional_env=SINGLE_THREAD_ENV,
         ))
 

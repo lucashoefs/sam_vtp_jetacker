@@ -61,10 +61,10 @@ tmux has-session -t $SESSION 2>/dev/null && {
 # Not set automatically: mode IDs differ between boards and JetPack versions,
 # and switching modes can reboot. Checked loudly instead.
 if command -v nvpmodel >/dev/null 2>&1; then
-    MODE="$(sudo nvpmodel -q 2>/dev/null | tr '\n' ' ')"
-    case "$MODE" in
-        *SUPER*|*MAXN*) echo "power mode: $MODE" ;;
-        *) echo "WARNING: power mode is '$MODE', not a MAXN/Super mode."
+    PWR_MODE="$(sudo nvpmodel -q 2>/dev/null | tr '\n' ' ')"
+    case "$PWR_MODE" in
+        *SUPER*|*MAXN*) echo "power mode: $PWR_MODE" ;;
+        *) echo "WARNING: power mode is '$PWR_MODE', not a MAXN/Super mode."
            echo "         GPU clock and memory bandwidth are capped below what"
            echo "         this board can do. 'sudo nvpmodel -m <id>' to fix;"
            echo "         'sudo nvpmodel -p --verbose' lists the ids." ;;
