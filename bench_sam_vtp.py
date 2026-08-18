@@ -6,8 +6,8 @@ Two things make naive timing of this model misleading:
   * It is RECURRENT. Memory attention conditions each frame on the previous
     num_maskmem frames, so a single-frame measurement means nothing.
   * CUDA graph capture only engages once the memory bank is FULL, and for
-    geometry checkpoints also once depth and pose are flowing. Averaging
-    across warmup badly understates steady-state throughput.
+    geometry checkpoints also once depth is flowing. Averaging across warmup
+    badly understates steady-state throughput.
 
 So this runs a real sequence and reports steady state separately from warmup.
 
@@ -32,12 +32,10 @@ trained checkpoint exists.
 from __future__ import annotations
 
 import argparse
-import math
 import statistics
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from sam_vtp_core import (
@@ -46,7 +44,6 @@ from sam_vtp_core import (
     CameraIntrinsics,
     SAMVTPStreamProcessor,
     build_model,
-    pose_from_optical,
 )
 
 # Dotted paths from the SAMVTP root. Most of the network lives under
@@ -111,8 +108,8 @@ def parse_args() -> argparse.Namespace:
                         "reproduce the ~1.4 s bank span the model trained with; "
                         "graph replay still applies, via a second captured graph")
     # Measured from camera_info on the D455f at 848x480 (89x59 deg FOV).
-    # Override for a different camera or resolution; these affect the warp
-    # geometry, not the cost.
+    # Override for a different camera or resolution; these affect the geometry
+    # channels, not the cost.
     p.add_argument("--fx", type=float, default=428.5935)
     p.add_argument("--fy", type=float, default=427.9190)
     p.add_argument("--cx", type=float, default=424.6508)
@@ -122,9 +119,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-fit", choices=["stretch", "crop", "pad"],
                    default="stretch",
                    help="how a non-square frame is fitted to the square input")
-    # Synthetic trajectory. Shapes the warp's workload, not its cost.
-    p.add_argument("--speed", type=float, default=0.5, help="m/s forward")
-    p.add_argument("--yaw-rate", type=float, default=0.2, help="rad/s")
     p.add_argument("--fps", type=float, default=15.0, help="simulated frame rate")
     return p.parse_args()
 
@@ -173,7 +167,7 @@ def make_pool(args):
         rgbs.append((rgb * 255.0).clamp(0, 255))
 
         # A ground plane receding to the horizon, plus a little noise. Roughly
-        # the depth structure a forward-facing camera sees, so the warp does a
+        # the depth structure a forward-facing camera sees, so the geometry
         # representative amount of valid-pixel work.
         yy = torch.linspace(0.0, 1.0, h).view(1, 1, h, 1).expand(1, 1, h, w)
         d = 1.0 / (yy * 0.25 + 0.05)
@@ -186,35 +180,6 @@ def make_pool(args):
     print(f"pool memory : {mb:.0f} MB  (resized to "
           f"{args.width}x{args.height} inside step())")
     return rgbs, depths
-
-
-def make_pose(i: int, args) -> torch.Tensor:
-    """Pose i of a constant-curvature trajectory, as the model wants it.
-
-    Built through pose_from_optical so the benchmark exercises the same
-    conversion the ROS node uses. World frame is arbitrary; only relative
-    transforms are used.
-    """
-    dt = 1.0 / args.fps
-    t = i * dt
-    yaw = args.yaw_rate * t
-    if abs(args.yaw_rate) < 1e-9:
-        x, y = args.speed * t, 0.0
-    else:
-        r = args.speed / args.yaw_rate
-        x, y = r * math.sin(yaw), r * (1.0 - math.cos(yaw))
-
-    # Camera looks along the heading. Optical axes: x right, y down, z forward.
-    c, s = math.cos(yaw), math.sin(yaw)
-    R = torch.tensor([[-s, 0.0, c],
-                      [c,  0.0, s],
-                      [0.0, -1.0, 0.0]])
-    tr = math.sqrt(max(0.0, 1 + R[0, 0] + R[1, 1] + R[2, 2]))
-    w = tr / 2 if tr > 1e-6 else 1e-6
-    q = torch.tensor([[(R[2, 1] - R[1, 2]) / (4 * w),
-                       (R[0, 2] - R[2, 0]) / (4 * w),
-                       (R[1, 0] - R[0, 1]) / (4 * w), w]])
-    return pose_from_optical([x, y, 0.21], q)
 
 
 def summarise(name: str, samples_ms: list) -> None:
@@ -255,9 +220,8 @@ def run_mode(model, pool, args, use_fullgraph: bool) -> dict:
     captured_at = None
 
     for i in range(args.frames):
-        pose = make_pose(i, args)
         t0 = time.perf_counter()
-        result = stream.step(rgbs[i % n_pool], depth=depths[i % n_pool], pose=pose)
+        result = stream.step(rgbs[i % n_pool], depth=depths[i % n_pool])
         torch.cuda.synchronize(device)
         outer_ms.append((time.perf_counter() - t0) * 1000.0)
         inner_ms.append(result.elapsed_ms)
@@ -342,7 +306,7 @@ def run_breakdown(model, pool, args) -> None:
         if i == measure_from:
             active["on"] = True
         t0 = time.perf_counter()
-        stream.step(rgbs[i % n_pool], depth=depths[i % n_pool], pose=make_pose(i, args))
+        stream.step(rgbs[i % n_pool], depth=depths[i % n_pool])
         if active["on"]:
             wall_ms.append((time.perf_counter() - t0) * 1000.0)
 
@@ -365,7 +329,7 @@ def run_breakdown(model, pool, args) -> None:
     print(f"  {'wall per frame':<22} {wall:>10.2f}")
     print(f"  {'unattributed':<22} {wall-measured:>10.2f} "
           f"{100.0*(wall-measured)/wall:>9.1f}%")
-    print("\n  Unattributed = warp, pre/post-processing, launch overhead and the")
+    print("\n  Unattributed = pre/post-processing, launch overhead and the")
     print("  Python glue between submodules. If it is large, CUDA graphs help")
     print("  more than kernel-level optimisation does.")
 
@@ -386,7 +350,7 @@ def main() -> int:
 
     device = torch.device("cuda")
     model, cam = build_the_model(args, device)
-    print(f"geometry    : {model.use_geometry}   warp: {model.warp_memory}")
+    print(f"geometry    : {model.use_geometry}")
     hfov, vfov = cam.fov_deg()
     print(f"intrinsics  : fx={cam.fx:.1f} fy={cam.fy:.1f} @ "
           f"{cam.width}x{cam.height} native  ({hfov:.0f}x{vfov:.0f} deg FOV)")
@@ -394,7 +358,7 @@ def main() -> int:
         print(f"              ^ training was 90x90 deg. Get real values from "
               f"camera_info;")
         print(f"                the defaults here are a guess and change the "
-              f"warp geometry.")
+              f"geometry channels.")
 
     # Pay lazy cuDNN/workspace init off the clock so it does not land in the
     # first measured frame.

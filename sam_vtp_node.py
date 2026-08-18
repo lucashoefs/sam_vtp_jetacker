@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
-"""ROS 2 node for geometry-aware SAM-VTP: RGB + aligned depth + camera pose.
+"""ROS 2 node for geometry-aware SAM-VTP: RGB + aligned depth.
 
-Three conversions happen here, and each is the kind that produces plausible
-but wrong output if you get it backwards.
+The model takes no pose, odometry or TF of any kind -- the geometry channels are
+a function of depth and intrinsics alone -- so this node has no localisation
+dependency and never drops a frame waiting for a transform.
+
+Two conversions happen here, and each is the kind that produces plausible but
+wrong output if you get it backwards.
 
 1. DEPTH UNITS. RealSense publishes aligned depth as 16UC1 in MILLIMETRES.
    The model wants float32 METRES. Zeros mean "no return" and become 0.0,
    which the model's own min_depth gate excludes - do not fill them.
 
-2. POSE AXES. The model's warp maps optical axes into a NED body frame
-   (x forward, y right, z down) via a fixed permutation, then uses only the
-   RELATIVE transform between two poses:
-
-       A = P^T @ R_mem^-1 @ R_cur @ P
-
-   Because it is relative, the world frame's absolute orientation cancels:
-   ROS `odom` works and true NED is not required. What does matter is that the
-   supplied rotation takes NED-BODY camera axes into the world. TF gives us
-   the OPTICAL frame, so we post-multiply by the optical->NED-body rotation,
-   which as a scalar-last quaternion is (-0.5, -0.5, -0.5, 0.5).
-
-3. INTRINSICS. Taken from camera_info at NATIVE resolution and handed to
+2. INTRINSICS. Taken from camera_info at NATIVE resolution and handed to
    CameraIntrinsics unscaled. The model rescales internally with the correct
    pixel-centre convention, and handles the non-square 848x480 -> 512x512
    resize correctly because fx and fy scale independently.
-
-Pose is looked up at the IMAGE timestamp, not now(). At 0.5 m/s a 60 ms error
-is 3 cm of translation, enough to visibly smear the warp.
 """
 
 from __future__ import annotations
@@ -35,7 +24,6 @@ import threading
 import time
 from typing import Optional
 
-import numpy as np
 import rclpy
 import torch
 import torch.nn.functional as F
@@ -47,18 +35,15 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Float32, Header, String
-from tf2_ros import Buffer, TransformListener
 
 from sam_vtp_core import (
     CameraIntrinsics,
     SAMVTPStreamProcessor,
     build_model,
     depth_from_uint16_mm,
-    pose_from_optical,
     tune_for_inference,
 )
 
-# The axis conversion lives in the library (pose_from_optical). Do NOT also
 # set _R_OPT2NED to the identity: applying the rotation twice silently sends
 # the ego-motion displacement down the wrong axis, with no error raised.
 
@@ -73,7 +58,6 @@ class SamVtpGeometryNode(Node):
             "depth_topic", "/camera/d455/aligned_depth_to_color/image_raw"
         )
         self.declare_parameter("info_topic", "/camera/d455/color/camera_info")
-        self.declare_parameter("world_frame", "odom")
         self.declare_parameter("model_height", 512)
         self.declare_parameter("model_width", 512)
         self.declare_parameter("threshold", 0.5)
@@ -107,9 +91,6 @@ class SamVtpGeometryNode(Node):
         # after which inference runs ~2x slower until capture re-engages. Only
         # worth doing when the memory really is describing a vanished scene.
         self.declare_parameter("stale_memory_sec", 5.0)
-        # How far the nearest available transform may be from the image stamp
-        # before the frame is dropped rather than warped with a stale pose.
-        self.declare_parameter("max_pose_skew_s", 0.12)
         self.declare_parameter("publish_probability", True)
         self.declare_parameter("log_every_n", 150)
         # DEGENERATE OUTPUT WATCH.
@@ -138,12 +119,10 @@ class SamVtpGeometryNode(Node):
         self.threshold = float(g("threshold"))
         # Same comparison the CPU path used, hoisted out of the per-frame path.
         self.threshold_u8 = int(self.threshold * 255)
-        self.world_frame = str(g("world_frame"))
         self.depth_scale = float(g("depth_scale"))
         self.stale_sec = float(g("stale_memory_sec"))
         self.log_every_n = int(g("log_every_n"))
         self.input_fit = str(g("input_fit"))
-        self.max_pose_skew = float(g("max_pose_skew_s"))
         self.degen_thresh = float(g("degenerate_max_prob"))
         self.degen_frames = int(g("degenerate_frames"))
         self.auto_reset = bool(g("auto_reset_on_degenerate"))
@@ -157,19 +136,10 @@ class SamVtpGeometryNode(Node):
             raise RuntimeError("CUDA unavailable; refusing to run on CPU")
 
         self.bridge = CvBridge()
-        self.tf_buffer = Buffer()
-        # A blocking lookup_transform() inside a callback needs OTHER
-        # callbacks - notably /tf - to keep being serviced, or it waits for a
-        # transform that can never arrive. Two ways to get that wrong:
-        #   * plain rclpy.spin(): single-threaded, deadlocks until timeout.
-        #   * TransformListener(spin_thread=True): adds THIS node to a second
-        #     executor while main() adds it to another. Two executors owning
-        #     one node is undefined; here /tf silently stopped being
-        #     delivered and never resumed.
-        # A MultiThreadedExecutor plus a reentrant group is the arrangement
-        # that actually works. See main().
+        # Kept: the image/depth subscriptions still sit in a reentrant group on
+        # a MultiThreadedExecutor so the synchroniser and the worker do not
+        # serialise against each other. See main().
         self.cb_group = ReentrantCallbackGroup()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Intrinsics must be known before the model is built, so block here.
         self.get_logger().info(f"waiting for {g('info_topic')} ...")
@@ -205,14 +175,14 @@ class SamVtpGeometryNode(Node):
         # before warmup(), which is what fixes the shapes and pays for any
         # algorithm search off the clock.
         self.get_logger().info(tune_for_inference(self.model))
-        # Read from the checkpoint, never assumed: a model without the warp does
-        # not need TF at all, and saying so here is what actually removes the
-        # dependency from the pipeline.
-        self.needs_pose = bool(getattr(self.model, "needs_pose", True))
-        self.get_logger().info(
-            f"pose required by this checkpoint: {self.needs_pose}"
-            + ("" if self.needs_pose else "  (no TF dependency; frames will not "
-                                          "be dropped for a stale transform)"))
+        # The library removed the ego-motion warp, so nothing reads pose. Assert
+        # it rather than assume it: a checkpoint that still wanted one would
+        # otherwise be run silently without it.
+        if bool(getattr(self.model, "needs_pose", False)):
+            raise RuntimeError(
+                "this checkpoint reports needs_pose=True, but this node no "
+                "longer supplies a pose. Use a checkpoint trained without the "
+                "ego-motion warp.")
 
         write_every = max(1, int(g("memory_write_every")))
         self.stream = SAMVTPStreamProcessor(
@@ -243,8 +213,6 @@ class SamVtpGeometryNode(Node):
         self.running = True
         self.dropped = 0
         self.processed = 0
-        self.no_pose = 0
-        self.skewed_poses = 0
         self._graph_active = False
         self.last_infer_end = 0.0
 
@@ -308,79 +276,8 @@ class SamVtpGeometryNode(Node):
                 "temporal memory reset by request; CUDA graph will re-capture "
                 "over the next ~20 frames")
 
-    def _lookup_pose(self, header) -> Optional[np.ndarray]:
-        """Camera pose as [x y z qx qy qz qw] with NED-body camera axes.
-
-        NON-BLOCKING by design. A blocking lookup inside a callback needs /tf
-        to keep being delivered while it waits, and that is only true if the
-        TF subscriptions sit in a reentrant callback group on a multithreaded
-        executor - which TransformListener does not arrange for you. Getting
-        it wrong does not fail loudly; /tf simply stops being serviced and
-        every lookup times out.
-
-        With odometry at 50 Hz and images ~87 ms old, the transform for an
-        image stamp is normally already buffered, so timeout=0 costs nothing.
-
-        If the exact stamp is unavailable we fall back to the newest transform
-        and accept it only if it is close enough in time. The warp needs
-        short-horizon relative pose, so a few tens of milliseconds of skew is
-        immaterial; at 0.3 m/s, 120 ms is 3.6 cm.
-        """
-        zero = rclpy.duration.Duration(seconds=0.0)
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.world_frame, header.frame_id, header.stamp, timeout=zero)
-        except Exception as exact_exc:  # noqa: BLE001
-            try:
-                tf = self.tf_buffer.lookup_transform(
-                    self.world_frame, header.frame_id, rclpy.time.Time(),
-                    timeout=zero)
-            except Exception:  # noqa: BLE001
-                if self.no_pose < 3:
-                    stamp = header.stamp.sec + header.stamp.nanosec * 1e-9
-                    skew = self.get_clock().now().nanoseconds * 1e-9 - stamp
-                    self.get_logger().warn(
-                        f"TF unavailable ({type(exact_exc).__name__}): "
-                        f"{exact_exc}; image stamp {skew*1000:.0f} ms behind "
-                        f"node clock")
-                return None
-
-            want = header.stamp.sec + header.stamp.nanosec * 1e-9
-            got = (tf.header.stamp.sec + tf.header.stamp.nanosec * 1e-9)
-            gap = abs(want - got)
-            if gap > self.max_pose_skew:
-                self.get_logger().warn(
-                    f"nearest transform is {gap*1000:.0f} ms from the image "
-                    f"stamp (limit {self.max_pose_skew*1000:.0f} ms); "
-                    f"dropping frame", throttle_duration_sec=5.0)
-                return None
-            self.skewed_poses += 1
-
-        t = tf.transform.translation
-        r = tf.transform.rotation
-        # header.frame_id is the colour OPTICAL frame, so this is exactly the
-        # case pose_from_optical is for. Translation and rotation must be of
-        # the same frame; mixing base_link position with camera rotation adds
-        # a lever-arm error that does not cancel when the robot turns.
-        return pose_from_optical([t.x, t.y, t.z], [r.x, r.y, r.z, r.w])
-
     # ------------------------------------------------------------------
     def _on_pair(self, color_msg: Image, depth_msg: Image) -> None:
-        # Only the memory warp reads pose. A geometry-only checkpoint derives its
-        # channels from depth and intrinsics alone, so refusing to run without a
-        # transform would impose a localisation dependency the weights do not
-        # have -- and it is not free: a stale TF drops the frame outright, which
-        # is where `no_pose` and part of `dropped` come from on this robot.
-        pose = None
-        if self.needs_pose:
-            pose = self._lookup_pose(color_msg.header)
-            if pose is None:
-                self.no_pose += 1
-                self.get_logger().warn(
-                    f"no transform {self.world_frame} -> {color_msg.header.frame_id}; "
-                    "is odometry running?", throttle_duration_sec=5.0)
-                return
-
         try:
             rgb = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="rgb8")
             depth_raw = self.bridge.imgmsg_to_cv2(
@@ -403,7 +300,7 @@ class SamVtpGeometryNode(Node):
         with self.lock:
             if self.pending is not None and self.pending_seq > self.consumed_seq:
                 self.dropped += 1
-            self.pending = (rgb, depth_m, depth_valid, pose, color_msg.header)
+            self.pending = (rgb, depth_m, depth_valid, color_msg.header)
             self.pending_seq += 1
             self.lock.notify()
 
@@ -415,14 +312,14 @@ class SamVtpGeometryNode(Node):
                     self.lock.wait(timeout=0.5)
                 if not self.running:
                     return
-                rgb, depth, depth_valid, pose, header = self.pending
+                rgb, depth, depth_valid, header = self.pending
                 self.consumed_seq = self.pending_seq
             try:
-                self._infer(rgb, depth, depth_valid, pose, header)
+                self._infer(rgb, depth, depth_valid, header)
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"inference failed: {exc}")
 
-    def _infer(self, rgb, depth, depth_valid, pose, header) -> None:
+    def _infer(self, rgb, depth, depth_valid, header) -> None:
         now = time.monotonic()
         if (self.stale_sec > 0 and self.processed > 0
                 and now - self.last_infer_end > self.stale_sec):
@@ -431,8 +328,7 @@ class SamVtpGeometryNode(Node):
                 f"(CUDA graph will re-capture over the next ~20 frames)")
             self.stream.reset()
 
-        result = self.stream.step(rgb, depth=depth, pose=pose,
-                                  depth_valid=depth_valid)
+        result = self.stream.step(rgb, depth=depth, depth_valid=depth_valid)
         self.last_infer_end = time.monotonic()
         self.processed += 1
 
@@ -453,7 +349,7 @@ class SamVtpGeometryNode(Node):
         # resize -- thresholding first and interpolating after would blur the
         # decision boundary back into grey -- but neither step needs the CPU.
         #
-        # The CPU version of this was `np.where(prob >= t, 255, 0).astype(u8)`,
+        # The CPU version of this was `numpy.where(prob >= t, 255, 0).astype(u8)`,
         # which builds a 407k-element int64 intermediate before narrowing it,
         # and measured ~20x the cost of the comparison itself.
         # Peak probability BEFORE thresholding. This is what separates a
@@ -513,7 +409,7 @@ class SamVtpGeometryNode(Node):
         if self.log_every_n and self.processed % self.log_every_n == 0:
             self.get_logger().info(
                 f"frames={self.processed} dropped={self.dropped} "
-                f"no_pose={self.no_pose} infer={result.elapsed_ms:.1f}ms "
+                f"infer={result.elapsed_ms:.1f}ms "
                 f"age={age:.0f}ms"
             )
 
@@ -525,7 +421,6 @@ class SamVtpGeometryNode(Node):
             f"ready={ready} processed={self.processed} dropped={self.dropped} "
             f"in={self.frames_in} synced={self.processed + self.dropped} "
             f"unsynced={max(0, self.frames_in - self.processed - self.dropped)} "
-            f"no_pose={self.no_pose} skewed={self.skewed_poses} "
             f"collapses={self.degen_events} "
             f"graph={self.stream.graph_status}"
         )))

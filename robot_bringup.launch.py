@@ -235,8 +235,9 @@ def launch_setup(context, *args, **kwargs):
         ))
 
     if _flag(context, "odometry"):
-        # Must be publishing before the model starts, or every frame is
-        # dropped for want of a pose.
+        # The MODEL no longer needs a pose (the ego-motion warp was removed),
+        # but the arc planner and pure-pursuit still transform through odom, so
+        # this must be up before they are.
         actions.append(ExecuteProcess(
             cmd=[
                 "python3", os.path.join(JETACKER_DIR, "jetacker_odometry.py"),
@@ -261,7 +262,6 @@ def launch_setup(context, *args, **kwargs):
                 "-p", f"color_topic:=/{CAM_NS}/{CAM_NAME}/color/image_raw",
                 "-p", f"depth_topic:=/{CAM_NS}/{CAM_NAME}/aligned_depth_to_color/image_raw",
                 "-p", f"info_topic:=/{CAM_NS}/{CAM_NAME}/color/camera_info",
-                "-p", "world_frame:=odom",
                 "-p", f"input_fit:={LaunchConfiguration('input_fit').perform(context)}",
                 # Memory writes 0.2 s apart whatever the camera rate, so the
                 # 7-slot bank spans the ~1.4 s the model trained with.
@@ -464,8 +464,9 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_pitch_deg", default_value="0.0"),
         # 0.93 indoors on hard flooring; 1.01 outdoors on grass, where the
         # tyres bite differently. Measured by comparing odom displacement
-        # against a tape over 1.58 m. Recalibrate per surface - this only
-        # affects pose fed to the model's memory warp, not control.
+        # against a tape over 1.58 m. Recalibrate per surface - this affects the
+        # planner's BEV projection and pure-pursuit tracking. The model does not
+        # read pose at all.
         DeclareLaunchArgument("speed_scale", default_value="1.01"),
         # stretch | crop | pad -- how 848x480 is fitted to the square model
         # input. The D455f is 89x59 deg where training was 90x90, so this is
