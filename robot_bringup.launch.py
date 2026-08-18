@@ -388,6 +388,10 @@ def launch_setup(context, *args, **kwargs):
                 "--max-bag-duration", "300",  # 5 min files; a crash loses one
             ] + RECORD_TOPICS,
             output="screen",
+            # A recorder that dies at startup is silent and the run looks
+            # normal until you check the disk afterwards and find nothing.
+            emulate_tty=True,
+            on_exit=[LogInfo(msg="!!! ros2 bag record EXITED - NOT RECORDING !!!")],
         ))
 
     return actions
