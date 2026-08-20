@@ -36,7 +36,7 @@ from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Float32, Int32, String
 
 from rrc import RRCBoard
 
@@ -114,6 +114,12 @@ class JetAckerDriver(Node):
             depth=1,
         )
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, qos)
+        # Audible/visible confirmation. On a robot in a backyard there is no
+        # screen, so a stop that cannot be heard cannot be trusted: you end up
+        # walking over to check, which is the thing being avoided. The driver
+        # owns the serial port, so this has to live here rather than in
+        # whichever node wants to beep.
+        self.create_subscription(Int32, "beep", self._on_beep, 1)
 
         self.pub_steer = self.create_publisher(Float32, "~/steer_angle_deg", 10)
         self.pub_status = self.create_publisher(String, "~/status", 10)
@@ -136,6 +142,17 @@ class JetAckerDriver(Node):
             "Ackermann chassis: linear.x == 0 produces NO motion, "
             "angular.z alone does nothing"
         )
+
+    # ------------------------------------------------------------------
+    def _on_beep(self, msg: Int32) -> None:
+        n = max(0, min(8, int(msg.data)))
+        if not n:
+            return
+        # Board-timed: both calls just write a packet, so neither blocks the
+        # control loop waiting on the beep to finish.
+        with self.lock:
+            self.board.set_buzzer(freq=2400, on_s=0.12, off_s=0.10, repeat=n)
+            self.board.set_led(on_s=0.12, off_s=0.10, repeat=n)
 
     # ------------------------------------------------------------------
     def _on_cmd_vel(self, msg: Twist) -> None:

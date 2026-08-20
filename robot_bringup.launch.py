@@ -137,6 +137,11 @@ RECORD_TOPICS = [
     "/pure_pursuit/status",
     "/deadman/status",
     "/deadman/passing",
+    # Why the trial ended, written by the supervisor. The trial log's most
+    # important column, recorded automatically rather than remembered.
+    "/trial_supervisor/reason",
+    "/trial_supervisor/status",
+    "/beep",
     "/waypoint_follower/waypoint_index",
     "/waypoint_follower/distance_to_goal",
     "/waypoint_follower/path_length",
@@ -364,6 +369,21 @@ def launch_setup(context, *args, **kwargs):
             cwd=JETACKER_DIR, output="screen", additional_env=SINGLE_THREAD_ENV,
         ))
 
+        # Ends the trial without a network: pick the robot up, or let a
+        # limit fire. NOT respawned - it latches an e-stop and then shuts the
+        # launch down, so a respawning copy would fight its own shutdown.
+        actions.append(ExecuteProcess(
+            cmd=["python3", os.path.join(JETACKER_DIR, "trial_supervisor.py"),
+                 "--ros-args",
+                 "-r", "deadman_passing:=/deadman/passing",
+                 "-p", f"tilt_deg:={LaunchConfiguration('stop_tilt_deg').perform(context)}",
+                 "-p", f"geofence_m:={LaunchConfiguration('geofence_m').perform(context)}",
+                 "-p", f"max_duration_s:={LaunchConfiguration('max_trial_s').perform(context)}",
+                 "-p", f"shutdown:={LaunchConfiguration('auto_shutdown').perform(context)}"],
+            cwd=JETACKER_DIR, output="screen", emulate_tty=True,
+            additional_env=SINGLE_THREAD_ENV,
+        ))
+
         # In forward mode nothing publishes goal_pose, and the planner falls
         # back to a body-relative goal on its own. Distance travelled comes
         # from /odom in the bag rather than from this node.
@@ -487,6 +507,19 @@ def generate_launch_description():
         DeclareLaunchArgument("route", default_value=os.path.join(
             HOME, "jetacker", "routes", "route_a.yaml")),
         DeclareLaunchArgument("max_speed", default_value="0.25"),
+        # --- ending a trial without the network -------------------------
+        # Tilt from vertical that counts as "picked up". Measured over 967
+        # samples of real driving the worst tilt was 11.7 deg, and the pickup
+        # sat at 52 deg median, so 30 leaves ~13 deg of margin either side.
+        # 0 disables it.
+        DeclareLaunchArgument("stop_tilt_deg", default_value="30.0"),
+        # Straight-line distance from where the trial started. 0 disables.
+        DeclareLaunchArgument("geofence_m", default_value="25.0"),
+        # Wall time from first motion. 0 disables.
+        DeclareLaunchArgument("max_trial_s", default_value="180.0"),
+        # Whether ending a trial also shuts the launch down, which is what
+        # closes the bag. Off leaves the robot stopped with the stack up.
+        DeclareLaunchArgument("auto_shutdown", default_value="true"),
         DeclareLaunchArgument("foxglove", default_value="true"),
         # See the foxglove_bridge block for why these exist. Compression costs
         # CPU on a board whose CPU is already shared with the perception node,

@@ -23,6 +23,10 @@
 # Nothing moves on startup. The deadman and pure pursuit both come up
 # DISABLED, so a stack left running unattended stays still.
 #
+# To END a run with no network: PICK THE ROBOT UP. Tilting it past 30 deg for
+# 0.4 s latches the e-stop, beeps twice, and closes the bag. It also ends on
+# its own at 180 s, 25 m, or 15 s stuck. See trial_supervisor.py.
+#
 #   Ctrl-b <arrow>  move   Ctrl-b z  zoom   Ctrl-b d  detach
 #   tmux attach -t robot   tmux kill-session -t robot
 
@@ -164,7 +168,7 @@ P_STATUS=$(tmux split-window -t "$P_OPS" -v -c "$JETACKER" -P -F '#{pane_id}')
 tmux send-keys -t "$P_STATUS" "$SRC && clear" C-m
 if [ "$MODE" = "auto" ]; then
     tmux send-keys -t "$P_STATUS" \
-      "watch -n1 'ros2 topic echo /deadman/status --once 2>/dev/null; ros2 topic echo /pure_pursuit/status --once 2>/dev/null; ros2 topic echo /waypoint_follower/status --once 2>/dev/null'" C-m
+      "watch -n1 'ros2 topic echo /trial_supervisor/status --once 2>/dev/null; ros2 topic echo /deadman/status --once 2>/dev/null; ros2 topic echo /pure_pursuit/status --once 2>/dev/null; ros2 topic echo /waypoint_follower/status --once 2>/dev/null'" C-m
 else
     tmux send-keys -t "$P_STATUS" "ros2 topic echo /sam_vtp/status"
 fi
