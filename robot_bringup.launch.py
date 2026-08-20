@@ -92,6 +92,21 @@ RECORD_TOPICS = [
     "/sam_vtp/latency_ms",
     "/sam_vtp/frame_age_ms",
     "/sam_vtp/status",
+    # How often the recurrent state collapses IS a result about the method,
+    # and max_prob separates collapse (max ~0) from a model still
+    # discriminating but under threshold (max ~0.4). Neither is recoverable
+    # from the binary mask after the fact.
+    "/sam_vtp/degenerate",
+    "/sam_vtp/max_prob",
+    # Warm-up: Sec. V concedes a sequence-initialisation cost, and this is
+    # what dates it against the enable transition.
+    "/sam_vtp/ready",
+    # The enable sequence and the E-STOP. /deadman/status carries these in its
+    # text at 1 Hz, which is too coarse to time an intervention against; these
+    # are latched Bools and cost nothing.
+    "/estop",
+    "/deadman_enable",
+    "/pursuit_enable",
     "/cmd_vel",
     "/cmd_vel_raw",
     "/odom",
