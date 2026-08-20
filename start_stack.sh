@@ -7,6 +7,15 @@
 #   ./start_stack.sh auto     + pure pursuit, deadman, waypoints
 #   ./start_stack.sh auto route_b record
 #
+# Environment overrides (all optional):
+#
+#   FPS=5            camera rate; the node's memory stride follows it
+#   COMPONENTS=...   which arm to run, e.g. COMPONENTS=memory=false
+#   FOXGLOVE=false   no live monitoring; see the warning below
+#   EXTRA=...        anything else passed straight to ros2 launch
+#
+#   COMPONENTS=memory=false FOXGLOVE=false ./start_stack.sh auto route_a record
+#
 # Panes:
 #   0  launch output (all nodes)          2  status watch
 #   1  operator commands, pre-typed       3  E-STOP, pre-typed
@@ -23,6 +32,14 @@ ROUTE="${2:-route_a}"
 RECORD="${3:-}"
 # Override with e.g. FPS=5 ./start_stack.sh auto
 FPS="${FPS:-15}"
+# Which arm of the perception comparison. Empty = the checkpoint as trained.
+COMPONENTS="${COMPONENTS:-}"
+# Live monitoring. Default unchanged, but see the record warning below: on a
+# marginal link this is the one component that can steal CPU from perception
+# at the exact moment it matters.
+FOXGLOVE="${FOXGLOVE:-true}"
+# Free-form passthrough to ros2 launch, for anything without a variable here.
+EXTRA="${EXTRA:-}"
 
 SESSION=robot
 JETACKER=$HOME/jetacker
@@ -39,13 +56,39 @@ case "$MODE" in
 esac
 
 ARGS="$ARGS route:=$JETACKER/routes/${ROUTE}.yaml fps:=${FPS}"
+ARGS="$ARGS foxglove:=${FOXGLOVE}"
+# Empty is not "the default" downstream -- the launch file omits the -p rather
+# than passing `components:=`, which would kill rclpy.init() before the node
+# exists. Omit it here too so the two agree.
+[ -n "$COMPONENTS" ] && ARGS="$ARGS components:=${COMPONENTS}"
 [ "$RECORD" = "record" ] && ARGS="$ARGS record:=true"
+[ -n "$EXTRA" ] && ARGS="$ARGS $EXTRA"
 
 if [ "$MODE" != "base" ] && [ ! -f "$SAMVTP/sam_vtp.pt" ]; then
     echo "checkpoint not found: $SAMVTP/sam_vtp.pt"; exit 1
 fi
 if [ "$MODE" = "auto" ] && [ ! -f "$JETACKER/routes/${ROUTE}.yaml" ]; then
     echo "route not found: $JETACKER/routes/${ROUTE}.yaml"; exit 1
+fi
+
+# WiFi does not fail cleanly outdoors. A silently dropped link gives no TCP
+# RST, so foxglove_bridge can hold its ROS subscriptions for minutes and keep
+# serialising and deflate-compressing image topics for a client that is gone.
+# That is CPU taken from the perception node on a six-core board, during the
+# run. The planner has already once starved the camera node from 15 Hz to 8.5
+# through the same contention -- see the SINGLE_THREAD_ENV note in the launch
+# file. Watch the robot before the trial, not during it.
+if [ "$RECORD" = "record" ] && [ "$FOXGLOVE" != "false" ]; then
+    echo "WARNING: recording with foxglove:=true."
+    echo "         If the link degrades mid-run the bridge competes with"
+    echo "         perception for CPU. FOXGLOVE=false for recorded trials."
+    echo
+fi
+
+if [ -n "$COMPONENTS" ]; then
+    echo "COMPONENT ABLATION: $COMPONENTS"
+    echo "  (bag directory and /sam_vtp/status both record this)"
+    echo
 fi
 
 tmux has-session -t $SESSION 2>/dev/null && {
@@ -141,5 +184,6 @@ for p in "$P_LAUNCH" "$P_OPS" "$P_STATUS" "$P_ESTOP"; do
 done
 
 tmux select-pane -t "$P_OPS"
-echo "started '$SESSION' mode=$MODE route=$ROUTE fps=$FPS ${RECORD:+record}"
+echo "started '$SESSION' mode=$MODE route=$ROUTE fps=$FPS \
+foxglove=$FOXGLOVE ${COMPONENTS:+components=$COMPONENTS }${RECORD:+record}"
 tmux attach -t $SESSION
