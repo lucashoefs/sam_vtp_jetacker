@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import rclpy
 import torch
@@ -46,6 +46,42 @@ from sam_vtp_core import (
 
 # set _R_OPT2NED to the identity: applying the rotation twice silently sends
 # the ego-motion displacement down the wrong axis, with no error raised.
+
+_COMPONENT_NAMES = ("memory", "geometry", "refine")
+_TRUE = ("true", "1", "yes", "on")
+_FALSE = ("false", "0", "no", "off")
+
+
+def parse_components(spec: str) -> Dict[str, bool]:
+    """Parse `"memory=false,geometry=true"` into kwargs for set_components.
+
+    Every malformed input raises. Nothing here is lenient on purpose: a typo
+    that was quietly ignored would run the wrong arm for a whole trial
+    session, and the resulting bag would look exactly like a correct one.
+    """
+    out: Dict[str, bool] = {}
+    for item in spec.replace(" ", "").split(","):
+        if not item:
+            continue
+        name, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(
+                f"components: expected name=bool, got {item!r} "
+                f"(names: {', '.join(_COMPONENT_NAMES)})")
+        if name not in _COMPONENT_NAMES:
+            raise ValueError(
+                f"components: unknown component {name!r} "
+                f"(names: {', '.join(_COMPONENT_NAMES)})")
+        if name in out:
+            raise ValueError(f"components: {name!r} given twice")
+        low = value.lower()
+        if low in _TRUE:
+            out[name] = True
+        elif low in _FALSE:
+            out[name] = False
+        else:
+            raise ValueError(f"components: {name}={value!r} is not a boolean")
+    return out
 
 
 class SamVtpGeometryNode(Node):
@@ -79,6 +115,25 @@ class SamVtpGeometryNode(Node):
         # channel), 'crop' matches training aspect but loses horizontal FOV,
         # 'pad' keeps the width and feeds bars. Compare on real data.
         self.declare_parameter("input_fit", "stretch")
+        # COMPONENT ABLATION -- which arm of the comparison this run is.
+        #
+        # Empty means "as the checkpoint was trained", which is what a normal
+        # deployment run wants. Otherwise a comma-separated list of name=bool,
+        # forwarded to SAMVTP.set_components:
+        #
+        #   memory=false                  frame-wise + geometry (SAM-TP + geo)
+        #   memory=false,geometry=false   frame-wise, RGB only  (SAM-TP)
+        #   geometry=false                RGB-only ablation
+        #
+        # These select which of the checkpoint's weights are USED; they cannot
+        # add a component the checkpoint lacks, and asking to enable one it
+        # lacks raises rather than running a randomly-initialised module.
+        #
+        # The resolved set is logged at startup and published in ~/status, so
+        # the bag itself records which arm produced it. Without that, a
+        # directory of interleaved A/B trials is indistinguishable from a
+        # directory of identical ones.
+        self.declare_parameter("components", "")
         # ApproximateTimeSynchronizer pairs colour with aligned depth. With
         # queue_size=2 any jitter between the two evicts a message before its
         # partner arrives, and the pair is silently lost - it never reaches
@@ -123,6 +178,9 @@ class SamVtpGeometryNode(Node):
         self.stale_sec = float(g("stale_memory_sec"))
         self.log_every_n = int(g("log_every_n"))
         self.input_fit = str(g("input_fit"))
+        # Parsed before anything expensive happens: a bad spec should fail in
+        # the first second, not after the model has loaded.
+        self.components = parse_components(str(g("components")))
         self.degen_thresh = float(g("degenerate_max_prob"))
         self.degen_frames = int(g("degenerate_frames"))
         self.auto_reset = bool(g("auto_reset_on_degenerate"))
@@ -167,8 +225,19 @@ class SamVtpGeometryNode(Node):
 
         self.get_logger().info("loading model...")
         self.model = build_model(
-            checkpoint, device=torch.device("cuda"), camera=cam
+            checkpoint, device=torch.device("cuda"), camera=cam,
+            components=self.components or None,
         )
+        active = self.model.active_components
+        # Sorted so the label is stable across runs and greps cleanly.
+        self.arm = ",".join(k for k, v in sorted(active.items()) if v) or "none"
+        if self.components:
+            self.get_logger().warn(
+                f"COMPONENT ABLATION: requested {self.components}, "
+                f"running with {self.arm} "
+                f"(checkpoint trained with {self.model.trained_components})")
+        else:
+            self.get_logger().info(f"components: {self.arm} (as trained)")
         self.model.input_normalization_mode = "0_255"
         # NHWC for the whole model: measured 50.3 -> 47.4 ms per frame on the
         # Orin, because narrow convolutions are badly served by NCHW. Must come
@@ -185,6 +254,9 @@ class SamVtpGeometryNode(Node):
                 "ego-motion warp.")
 
         write_every = max(1, int(g("memory_write_every")))
+        if not active["memory"] and write_every != 1:
+            self.get_logger().info(
+                f"memory is off; memory_write_every={write_every} has no effect")
         self.stream = SAMVTPStreamProcessor(
             self.model,
             resize_hw=self.model_hw,
@@ -418,6 +490,7 @@ class SamVtpGeometryNode(Node):
         ready = self.processed > 0
         self.pub_ready.publish(Bool(data=ready))
         self.pub_status.publish(String(data=(
+            f"arm={self.arm} "
             f"ready={ready} processed={self.processed} dropped={self.dropped} "
             f"in={self.frames_in} synced={self.processed + self.dropped} "
             f"unsynced={max(0, self.frames_in - self.processed - self.dropped)} "

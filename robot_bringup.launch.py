@@ -267,6 +267,13 @@ def launch_setup(context, *args, **kwargs):
         ))
 
     if _flag(context, "model"):
+        # An EMPTY value cannot be passed: `-p components:=` is malformed to
+        # the --ros-args parser and rclpy.init() exits before the node exists,
+        # with no logger and no traceback. Same trap as fusion_mode below.
+        comp = LaunchConfiguration("components").perform(context).strip()
+        comp_args = ["-p", f"components:={comp}"] if comp else []
+        if comp:
+            actions.append(LogInfo(msg=f"COMPONENT ABLATION: {comp}"))
         # venv python: torch. Not respawned - a crash here should be noticed.
         actions.append(ExecuteProcess(
             cmd=[
@@ -281,7 +288,7 @@ def launch_setup(context, *args, **kwargs):
                 # Memory writes 0.2 s apart whatever the camera rate, so the
                 # 7-slot bank spans the ~1.4 s the model trained with.
                 "-p", f"memory_write_every:={max(1, round(int(fps) / 5))}",
-            ],
+            ] + comp_args,
             cwd=JETACKER_DIR,
             output="screen",
             additional_env=dict(SINGLE_THREAD_ENV, OMP_NUM_THREADS="2"),
@@ -395,11 +402,21 @@ def launch_setup(context, *args, **kwargs):
     if _flag(context, "record"):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(bag_dir, exist_ok=True)
+        # Put the arm in the DIRECTORY NAME, not only in /sam_vtp/status. A
+        # session of interleaved A/B/B/A trials is otherwise a folder of
+        # identical-looking timestamps, and recovering which was which means
+        # opening every bag. "memory=false,geometry=false" -> "mem0-geo0".
+        arm = LaunchConfiguration("components").perform(context).strip()
+        slug = "-".join(
+            f"{k.strip()[:3]}{'1' if v.strip().lower() in ('true', '1', 'yes', 'on') else '0'}"
+            for k, _, v in (item.partition("=") for item in arm.split(",") if item.strip())
+        )
+        name = f"run_{stamp}" + (f"_{slug}" if slug else "")
         actions.append(ExecuteProcess(
             cmd=[
                 "ros2", "bag", "record",
                 "-s", "mcap",
-                "-o", os.path.join(bag_dir, f"run_{stamp}"),
+                "-o", os.path.join(bag_dir, name),
                 "--max-bag-duration", "300",  # 5 min files; a crash loses one
             ] + RECORD_TOPICS,
             output="screen",
@@ -443,6 +460,17 @@ def generate_launch_description():
         # as-deployed GeNIE blend, reported as the secondary condition.
         DeclareLaunchArgument("fusion_mode", default_value="",
                               description="'' | rgb | rgbd | veto"),
+        # Which arm of the perception comparison to run. "" = the checkpoint
+        # as trained (normal deployment). See sam_vtp_node.py's `components`
+        # parameter for the syntax and the arms:
+        #
+        #   components:=memory=false                 SAM-TP + geometry
+        #   components:=memory=false,geometry=false  SAM-TP
+        #
+        # Interleave arms WITHIN a session (A/B/B/A). Outdoor conditions drift
+        # enough that arms collected on different days are not comparable, and
+        # the pairing is the whole reason the small-n result is defensible.
+        DeclareLaunchArgument("components", default_value=""),
         DeclareLaunchArgument("goal_distance", default_value="3.0"),
         DeclareLaunchArgument("route", default_value=os.path.join(
             HOME, "jetacker", "routes", "route_a.yaml")),
