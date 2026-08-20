@@ -88,7 +88,19 @@ RECORD_TOPICS = [
     f"/{CAM_NS}/{CAM_NAME}/aligned_depth_to_color/image_raw/compressedDepth",
     f"/{CAM_NS}/{CAM_NAME}/aligned_depth_to_color/camera_info",
     f"/{CAM_NS}/{CAM_NAME}/extrinsics/depth_to_color",
-    "/sam_vtp/binary",
+    # PROBABILITY, not binary. This is the topic the planner actually
+    # consumes (score_topic), so recording it is what makes a run replayable
+    # through the planner offline; the binary mask never enters the control
+    # loop at all.
+    #
+    # It costs nothing to switch. Both are mono8 at the same resolution, and
+    # the node derives the mask from the quantised probability itself
+    # (`binary_u8 = prob_u8 >= threshold_u8`), so the binary is recovered
+    # EXACTLY as `prob_u8 >= 127` at the default 0.5 threshold -- no rounding
+    # ambiguity, nothing lost.
+    #
+    # Requires the node's publish_probability to stay true (its default).
+    "/sam_vtp/probability",
     "/sam_vtp/latency_ms",
     "/sam_vtp/frame_age_ms",
     "/sam_vtp/status",
