@@ -10,11 +10,13 @@
 # Environment overrides (all optional):
 #
 #   FPS=5            camera rate; the node's memory stride follows it
-#   COMPONENTS=...   which arm to run, e.g. COMPONENTS=memory=false
+#   MODEL=vtp|tp    which weights to run. vtp (default) = SAM-VTP,
+#                   tp = the SAM-TP baseline. This is the closed-loop A/B.
+#   COMPONENTS=...   ablate SAM-VTP's own components, e.g. COMPONENTS=memory=false
 #   FOXGLOVE=false   no live monitoring; see the warning below
 #   EXTRA=...        anything else passed straight to ros2 launch
 #
-#   COMPONENTS=memory=false FOXGLOVE=false ./start_stack.sh auto route_a record
+#   MODEL=tp FOXGLOVE=false ./start_stack.sh auto route_a record
 #
 # Panes:
 #   0  launch output (all nodes)          2  status watch
@@ -38,6 +40,21 @@ RECORD="${3:-}"
 FPS="${FPS:-15}"
 # Which arm of the perception comparison. Empty = the checkpoint as trained.
 COMPONENTS="${COMPONENTS:-}"
+# Named rather than a raw path so the two arms cannot be mistyped into each
+# other; both files are produced by export_checkpoint.py.
+MODEL="${MODEL:-vtp}"
+case "$MODEL" in
+    vtp) CKPT="$HOME/sam_vtp/sam_vtp.pt" ;;
+    tp)  CKPT="$HOME/sam_vtp/sam_tp.pt" ;;
+    *)   CKPT="$MODEL" ;;   # an explicit path, for anything else
+esac
+if [ ! -f "$CKPT" ]; then
+    echo "MODEL=$MODEL -> $CKPT does not exist on this machine." >&2
+    exit 1
+fi
+if [ ! -f "$CKPT.sha256" ]; then
+    echo "WARNING: no $CKPT.sha256 -- bags from this run cannot be traced to a build." >&2
+fi
 # Live monitoring. Default unchanged, but see the record warning below: on a
 # marginal link this is the one component that can steal CPU from perception
 # at the exact moment it matters.
@@ -64,6 +81,7 @@ ARGS="$ARGS foxglove:=${FOXGLOVE}"
 # Empty is not "the default" downstream -- the launch file omits the -p rather
 # than passing `components:=`, which would kill rclpy.init() before the node
 # exists. Omit it here too so the two agree.
+ARGS="$ARGS checkpoint:=${CKPT}"
 [ -n "$COMPONENTS" ] && ARGS="$ARGS components:=${COMPONENTS}"
 [ "$RECORD" = "record" ] && ARGS="$ARGS record:=true"
 [ -n "$EXTRA" ] && ARGS="$ARGS $EXTRA"

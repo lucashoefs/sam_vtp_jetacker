@@ -20,6 +20,7 @@ wrong output if you get it backwards.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Dict, Optional
@@ -46,6 +47,19 @@ from sam_vtp_core import (
 
 # set _R_OPT2NED to the identity: applying the rotation twice silently sends
 # the ego-motion displacement down the wrong axis, with no error raised.
+
+def _sidecar_sha(checkpoint: str) -> Optional[str]:
+    """The digest written beside the weights by export_checkpoint.py, if any.
+
+    Read rather than recomputed: hashing 134 MB on the Orin at every start
+    would buy nothing the export has not already established.
+    """
+    try:
+        with open(checkpoint + ".sha256", "r") as fh:
+            return fh.read().split()[0]
+    except OSError:
+        return None
+
 
 _COMPONENT_NAMES = ("memory", "geometry", "refine")
 _TRUE = ("true", "1", "yes", "on")
@@ -229,8 +243,19 @@ class SamVtpGeometryNode(Node):
             components=self.components or None,
         )
         active = self.model.active_components
+        # The switches alone do not identify a run: a SAM-TP checkpoint and
+        # SAM-VTP with memory switched off report identical components while
+        # being different models. Name the weights first, so a log line, a
+        # status string and a bag directory all say which arm produced them.
         # Sorted so the label is stable across runs and greps cleanly.
-        self.arm = ",".join(k for k, v in sorted(active.items()) if v) or "none"
+        self.model_id = os.path.splitext(os.path.basename(checkpoint))[0]
+        comps = ",".join(k for k, v in sorted(active.items()) if v) or "none"
+        self.arm = f"{self.model_id}[{comps}]"
+        sha = _sidecar_sha(checkpoint)
+        self.get_logger().info(
+            "weights: %s sha256:%s" % (self.model_id, sha[:12] if sha else
+            "UNKNOWN -- no .sha256 beside the checkpoint, so this bag cannot "
+            "be traced to a build. Export with export_checkpoint.py."))
         if self.components:
             self.get_logger().warn(
                 f"COMPONENT ABLATION: requested {self.components}, "

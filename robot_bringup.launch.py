@@ -67,6 +67,8 @@ HOME = os.path.expanduser("~")
 JETACKER_DIR = os.path.join(HOME, "jetacker")
 SAM_DIR = os.path.join(HOME, "sam_vtp")
 VENV_PY = os.path.join(SAM_DIR, ".venv", "bin", "python")
+# Default arm. The baseline arm is selected with `checkpoint:=~/sam_vtp/sam_tp.pt`;
+# both files are produced by export_checkpoint.py and carry a .sha256 sidecar.
 CHECKPOINT = os.path.join(SAM_DIR, "sam_vtp.pt")
 
 CAM_NS = "camera"
@@ -289,6 +291,13 @@ def launch_setup(context, *args, **kwargs):
         # with no logger and no traceback. Same trap as fusion_mode below.
         comp = LaunchConfiguration("components").perform(context).strip()
         comp_args = ["-p", f"components:={comp}"] if comp else []
+        ckpt = os.path.expanduser(
+            LaunchConfiguration("checkpoint").perform(context).strip() or CHECKPOINT)
+        if not os.path.exists(ckpt):
+            # Failing here beats failing after the camera, the driver and the
+            # recorder have all come up and the operator has walked away.
+            raise RuntimeError(f"checkpoint does not exist: {ckpt}")
+        actions.append(LogInfo(msg=f"perception weights: {ckpt}"))
         if comp:
             actions.append(LogInfo(msg=f"COMPONENT ABLATION: {comp}"))
         # venv python: torch. Not respawned - a crash here should be noticed.
@@ -297,7 +306,7 @@ def launch_setup(context, *args, **kwargs):
                 VENV_PY,
                 os.path.join(JETACKER_DIR, "sam_vtp_node.py"),
                 "--ros-args",
-                "-p", f"checkpoint:={CHECKPOINT}",
+                "-p", f"checkpoint:={ckpt}",
                 "-p", f"color_topic:=/{CAM_NS}/{CAM_NAME}/color/image_raw",
                 "-p", f"depth_topic:=/{CAM_NS}/{CAM_NAME}/aligned_depth_to_color/image_raw",
                 "-p", f"info_topic:=/{CAM_NS}/{CAM_NAME}/color/camera_info",
@@ -443,7 +452,14 @@ def launch_setup(context, *args, **kwargs):
             f"{k.strip()[:3]}{'1' if v.strip().lower() in ('true', '1', 'yes', 'on') else '0'}"
             for k, _, v in (item.partition("=") for item in arm.split(",") if item.strip())
         )
-        name = f"run_{stamp}" + (f"_{slug}" if slug else "")
+        # The weights name the arm. Without this every bag in an A/B/B/A session
+        # is called run_<timestamp> and the arms can only be recovered from the
+        # order they were started in -- which is exactly what stops being true
+        # the first time a trial is aborted and repeated.
+        model_slug = os.path.splitext(os.path.basename(os.path.expanduser(
+            LaunchConfiguration("checkpoint").perform(context).strip()
+            or CHECKPOINT)))[0].replace("_", "-")
+        name = f"run_{stamp}_{model_slug}" + (f"_{slug}" if slug else "")
         actions.append(ExecuteProcess(
             cmd=[
                 "ros2", "bag", "record",
@@ -496,13 +512,26 @@ def generate_launch_description():
         # as trained (normal deployment). See sam_vtp_node.py's `components`
         # parameter for the syntax and the arms:
         #
-        #   components:=memory=false                 SAM-TP + geometry
-        #   components:=memory=false,geometry=false  SAM-TP
+        #   components:=memory=false                 memory ablation
+        #   components:=geometry=false                RGB-only ablation
+        #
+        # These ablate the SAM-VTP weights and are NOT the SAM-TP baseline: the
+        # weights were fitted alongside the component they are now denied. The
+        # closed-loop baseline is a separately trained checkpoint, selected with
+        # `checkpoint:=`, which reports no component deviations.
         #
         # Interleave arms WITHIN a session (A/B/B/A). Outdoor conditions drift
         # enough that arms collected on different days are not comparable, and
         # the pairing is the whole reason the small-n result is defensible.
         DeclareLaunchArgument("components", default_value=""),
+        # Which weights perception runs. Both arms of the closed-loop comparison
+        # are checkpoints, not switches:
+        #
+        #   (default)                        SAM-VTP        ~/sam_vtp/sam_vtp.pt
+        #   checkpoint:=~/sam_vtp/sam_tp.pt  SAM-TP         (baseline)
+        #
+        # The basename ends up in the bag directory name, so keep them distinct.
+        DeclareLaunchArgument("checkpoint", default_value=CHECKPOINT),
         DeclareLaunchArgument("goal_distance", default_value="3.0"),
         DeclareLaunchArgument("route", default_value=os.path.join(
             HOME, "jetacker", "routes", "route_a.yaml")),
