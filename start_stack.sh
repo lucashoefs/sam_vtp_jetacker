@@ -13,10 +13,12 @@
 #   MODEL=vtp|tp    which weights to run. vtp (default) = SAM-VTP,
 #                   tp = the SAM-TP baseline. This is the closed-loop A/B.
 #   COMPONENTS=...   ablate SAM-VTP's own components, e.g. COMPONENTS=memory=false
-#   FOXGLOVE=false   no live monitoring; see the warning below
+#   FOXGLOVE=true   live monitoring. OFF by default: it competes with
+#                   perception for CPU, and that is worst exactly when the
+#                   link is degrading. See the warning below.
 #   EXTRA=...        anything else passed straight to ros2 launch
 #
-#   MODEL=tp FOXGLOVE=false ./start_stack.sh auto route_a record
+#   MODEL=tp ./start_stack.sh auto route_a record
 #
 # Panes:
 #   0  launch output (all nodes)          2  status watch
@@ -58,7 +60,10 @@ fi
 # Live monitoring. Default unchanged, but see the record warning below: on a
 # marginal link this is the one component that can steal CPU from perception
 # at the exact moment it matters.
-FOXGLOVE="${FOXGLOVE:-true}"
+# Off by default: every recorded trial wants it off, and a default that has
+# to be overridden on every run is a default that will eventually be forgotten
+# on the one run that mattered.
+FOXGLOVE="${FOXGLOVE:-false}"
 # Free-form passthrough to ros2 launch, for anything without a variable here.
 EXTRA="${EXTRA:-}"
 
@@ -101,9 +106,9 @@ fi
 # through the same contention -- see the SINGLE_THREAD_ENV note in the launch
 # file. Watch the robot before the trial, not during it.
 if [ "$RECORD" = "record" ] && [ "$FOXGLOVE" != "false" ]; then
-    echo "WARNING: recording with foxglove:=true."
+    echo "WARNING: recording with FOXGLOVE=$FOXGLOVE, which is not the default."
     echo "         If the link degrades mid-run the bridge competes with"
-    echo "         perception for CPU. FOXGLOVE=false for recorded trials."
+    echo "         perception for CPU. Unset FOXGLOVE for recorded trials."
     echo
 fi
 
