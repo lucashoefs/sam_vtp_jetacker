@@ -6,3 +6,6 @@ bags/
 *.pt
 *.engine
 frames.pdf
+
+# Linked from a GENIE-SAMTP checkout; see README
+genie_path_planner

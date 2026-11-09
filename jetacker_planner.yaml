@@ -109,8 +109,7 @@ planner:
 # Temporal fusion of past observations is DISABLED. GeNIE's planner has no
 # temporal fusion by default, and that is the condition under which perception
 # consistency matters most - which is the hypothesis under test. Enabling it
-# would smooth away the very effect being measured. Reviewer 4 asks what
-# happens with downstream fusion; answer that separately, offline, by
-# re-running recorded bags with this set to true.
+# would smooth away the very effect being measured. To evaluate downstream
+# fusion, re-run recorded bags offline with this set to true.
 observation_fusion:
   enabled: false
