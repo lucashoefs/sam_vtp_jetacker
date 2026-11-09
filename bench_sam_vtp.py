@@ -13,7 +13,7 @@ So this runs a real sequence and reports steady state separately from warmup.
 
 No checkpoint required. Timing depends only on architecture and shapes, not on
 weight values, so `--random-weights` builds an untrained model from
-SAMVTPConfig defaults and measures exactly the same work. Useful before a
+the default config and measures exactly the same work. Useful before a
 trained checkpoint exists.
 
     # throughput with no checkpoint
@@ -38,16 +38,16 @@ from pathlib import Path
 
 import torch
 
-from sam_vtp_core import (
-    SAMVTP,
-    SAMVTPConfig,
+from hydra.utils import instantiate
+from sam_vtp import (
     CameraIntrinsics,
     SAMVTPStreamProcessor,
+    build_config,
     build_model,
 )
 
 # Dotted paths from the SAMVTP root. Most of the network lives under
-# sam2_model (a SAM2Core); the geometry encoder and refinement head are
+# sam2_model (SAM 2's model); the geometry encoder and refinement head are
 # SAM-VTP additions and sit at the top level.
 BREAKDOWN_MODULES = [
     "sam2_model.image_encoder",
@@ -139,8 +139,7 @@ def build_the_model(args, device):
         print(f"weights     : {ckpt.name}")
         return model, cam
 
-    cfg = SAMVTPConfig()
-    model = SAMVTP(cfg).to(device).eval()
+    model = instantiate(build_config().model, _recursive_=True).to(device).eval()
     model.input_normalization_mode = "0_255"
     model.camera = cam
     print("weights     : RANDOM (untrained) - timing only, outputs are noise")

@@ -37,7 +37,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Float32, Header, String
 
-from sam_vtp_core import (
+from sam_vtp import (
     CameraIntrinsics,
     SAMVTPStreamProcessor,
     build_model,

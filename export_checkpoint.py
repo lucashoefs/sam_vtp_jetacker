@@ -29,7 +29,7 @@ import torch
 for _p in (os.path.expanduser("~/sam_vtp/src"), os.path.expanduser("~/sam_vtp")):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
-from sam_vtp_core.factory import build_model, describe  # noqa: E402
+from sam_vtp import build_model, describe  # noqa: E402
 
 KEEP = ("config", "epoch", "best_val_iou", "val_iou", "global_step")
 
